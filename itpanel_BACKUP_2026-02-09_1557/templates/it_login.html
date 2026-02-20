@@ -1,0 +1,29 @@
+{% extends 'layout.html' %}
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-md-6 col-lg-4">
+    <div class="card">
+      <div class="card-body p-4">
+        <h4 class="mb-1">IT Girişi</h4>
+        <div class="text-muted mb-4">Sadece IT ekibi erişebilir.</div>
+
+        <form method="POST">
+          <div class="mb-3">
+            <label class="form-label">Kullanıcı Adı</label>
+            <input class="form-control" name="username" autocomplete="username" required>
+          </div>
+          <div class="mb-4">
+            <label class="form-label">Şifre</label>
+            <input class="form-control" type="password" name="password" autocomplete="current-password" required>
+          </div>
+          <button class="btn btn-primary w-100" type="submit">Giriş Yap</button>
+        </form>
+
+        <div class="text-muted small mt-3">
+          Yetkin yoksa: talep oluşturma ekranını kullan.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

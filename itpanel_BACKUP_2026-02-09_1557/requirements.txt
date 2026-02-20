@@ -1,0 +1,7 @@
+flask
+gunicorn
+flask-wtf
+flask-sqlalchemy
+flask-login
+email-validator
+pillow

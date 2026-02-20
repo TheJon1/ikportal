@@ -1,0 +1,77 @@
+{% extends 'layout.html' %}
+{% block content %}
+
+<div class="d-flex align-items-center justify-content-between mb-3">
+  <div>
+    <h3 class="mb-0">Talepler</h3>
+    <div class="text-muted">En yeni talepler en üstte listelenir.</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-body">
+    <div class="table-responsive">
+      <table class="table align-middle mb-0">
+        <thead>
+          <tr>
+            <th>Talep No</th>
+            <th>Önem</th>
+            <th>Durum</th>
+            <th>Konu</th>
+            <th>Ad Soyad</th>
+            <th>Tarih</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for t in tickets %}
+          <tr>
+            <td class="fw-semibold">{{ t.ticket_no }}</td>
+            <td>
+              {% if t.priority == 'critical' %}
+                <span class="badge bg-danger">Kritik</span>
+              {% elif t.priority == 'high' %}
+                <span class="badge bg-warning text-dark">Yüksek</span>
+              {% elif t.priority == 'medium' %}
+                <span class="badge bg-info text-dark">Orta</span>
+              {% else %}
+                <span class="badge bg-secondary">Düşük</span>
+              {% endif %}
+            </td>
+
+            <td>
+              {% if t.status == 'open' %}
+                <span class="badge bg-primary">Açık</span>
+              {% elif t.status == 'pending' %}
+                <span class="badge bg-warning text-dark">Beklemede</span>
+              {% elif t.status == 'forwarded' %}
+                <span class="badge bg-purple" style="background:#6f42c1">Yönlendirildi</span>
+              {% elif t.status == 'closed' %}
+                <span class="badge bg-success">Kapalı</span>
+              {% else %}
+                <span class="badge bg-secondary">Bilinmiyor</span>
+              {% endif %}
+            </td>
+
+
+            <td>{{ t.subject }}</td>
+            <td>{{ t.full_name }}</td>
+            <td class="text-muted">{{ t.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td class="text-end">
+              <a class="btn btn-outline-primary btn-sm" href="{{ url_for('ticket_detail', ticket_id=t.id) }}">Aç</a>
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="6" class="text-center text-muted py-5">
+              Henüz talep yok. Sağ üstten “Yeni Talep” açabilirsin.
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+{% endblock %}

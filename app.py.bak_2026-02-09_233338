@@ -1,0 +1,2956 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import io
+import base64
+import sqlite3
+import hashlib
+import secrets
+import smtplib
+import time
+from werkzeug.middleware.proxy_fix import ProxyFix
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from datetime import datetime, date, timedelta
+from flask import Flask, request, redirect, url_for, session, abort, send_file, Response
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads", "it")
+ALLOWED_IMAGE_EXT = {"png", "jpg", "jpeg", "webp"}
+
+def allowed_image(filename):
+    if not filename:
+        return False
+    if "." not in filename:
+        return False
+    return filename.rsplit(".", 1)[1].lower() in ALLOWED_IMAGE_EXT
+
+
+def public_base_url():
+    host = request.host
+    return f"https://{host}"
+
+
+import qrcode
+from openpyxl import Workbook
+
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+APP_TITLE = "İK Portal"
+DB_PATH = os.environ.get("IK_DB_PATH", os.path.join(os.path.dirname(__file__), "ik.db"))
+SECRET_KEY = os.environ.get("IK_SECRET_KEY", "saDfasdwqefgdsvcxzfasdRqweasDASFGA")
+
+# SMTP (systemd env ile ver; yoksa mail sessizce pas geçer)
+SMTP_HOST = os.environ.get("IK_SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("IK_SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("IK_SMTP_USER", "")
+SMTP_PASS = os.environ.get("IK_SMTP_PASS", "")
+MAIL_FROM  = os.environ.get("IK_MAIL_FROM", SMTP_USER)
+
+QR_COOLDOWN_MINUTES = int(os.environ.get("IK_QR_COOLDOWN_MINUTES", "10"))
+
+# Roles
+ROLE_OWNER = "owner"
+ROLE_ACCOUNTING = "accounting"
+ROLE_MANAGER = "manager"
+ROLE_PERSONNEL = "personnel"
+ROLE_RESPONSIBLE = "responsible"   # ✅ NEW
+ROLE_IT = "it"
+ALLOWED_ROLES = {ROLE_OWNER, ROLE_ACCOUNTING, ROLE_MANAGER, ROLE_PERSONNEL, ROLE_RESPONSIBLE, ROLE_IT}
+
+# Attendance types
+TUR_GIRIS = "GIRIS"
+TUR_OGLE_CIKIS = "OGLE_CIKIS"
+TUR_OGLE_GIRIS = "OGLE_GIRIS"
+TUR_CIKIS = "CIKIS"
+TUR_SEQUENCE = [TUR_GIRIS, TUR_OGLE_CIKIS, TUR_OGLE_GIRIS, TUR_CIKIS]
+TUR_LABEL = {
+    TUR_GIRIS: "Giriş",
+    TUR_OGLE_CIKIS: "Öğle Çıkış",
+    TUR_OGLE_GIRIS: "Öğle Giriş",
+    TUR_CIKIS: "Çıkış",
+}
+
+# Leave statuses
+STATUS_PENDING = "Beklemede"
+STATUS_APPROVED = "Onaylandi"
+STATUS_REJECTED = "Reddedildi"
+
+# Advance statuses (✅ NEW)
+ADV_STATUS_PENDING = "Beklemede"
+ADV_STATUS_SENT_TO_OWNER = "PatronOnayinda"
+ADV_STATUS_APPROVED = "Onaylandi"
+ADV_STATUS_REJECTED = "Reddedildi"
+
+# Leave stages (✅ NEW for multi-step approval)
+STAGE_RESPONSIBLE = "RESPONSIBLE"
+STAGE_MANAGER = "MANAGER"
+STAGE_OWNER = "OWNER"
+STAGE_DONE = "DONE"
+
+
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
+
+# Nginx reverse proxy arkasında https/http doğru algılansın
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+# -----------------------------
+# DB helpers
+# -----------------------------
+def db_connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def query_one(sql, params=()):
+    conn = db_connect()
+    cur = conn.execute(sql, params)
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def query_all(sql, params=()):
+    conn = db_connect()
+    cur = conn.execute(sql, params)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def exec_sql(sql, params=()):
+    conn = db_connect()
+    cur = conn.execute(sql, params)
+    conn.commit()
+    last_id = cur.lastrowid
+    conn.close()
+    return last_id
+
+def table_has_column(conn, table, col):
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in cur.fetchall()]
+    return col in cols
+
+def init_db():
+    conn = db_connect()
+
+    # Users:
+    # - email: mail atmak için
+    # - manager_id: personelin müdürü (users.id)
+    # - responsible_id: personelin sorumlusu (users.id) ✅ NEW
+    # - annual_leave_days: yıllık izin hakkı
+    # - hire_date: işe giriş tarihi (opsiyon)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        full_name TEXT NOT NULL,
+        username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'personnel',
+        is_active INTEGER NOT NULL DEFAULT 1,
+
+        email TEXT,
+        manager_id INTEGER,
+        responsible_id INTEGER,
+
+        hire_date TEXT,
+        annual_leave_days INTEGER NOT NULL DEFAULT 14,
+
+        can_qr INTEGER NOT NULL DEFAULT 0,
+        qr_secret TEXT,
+
+        FOREIGN KEY(manager_id) REFERENCES users(id),
+        FOREIGN KEY(responsible_id) REFERENCES users(id)
+    )
+    """)
+
+    # Leave requests
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS leave_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        start_date TEXT NOT NULL,
+        end_date TEXT NOT NULL,
+        leave_type TEXT NOT NULL DEFAULT 'Yillik',
+        reason TEXT,
+        status TEXT NOT NULL DEFAULT 'Beklemede',
+        created_at TEXT NOT NULL,
+        decided_at TEXT,
+        decided_by INTEGER,
+
+        pending_with INTEGER,
+        stage TEXT,
+
+        FOREIGN KEY(user_id) REFERENCES users(id),
+        FOREIGN KEY(decided_by) REFERENCES users(id),
+        FOREIGN KEY(pending_with) REFERENCES users(id)
+    )
+    """)
+
+    # Attendance logs
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS attendance (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        tarih TEXT NOT NULL,
+        saat  TEXT NOT NULL,
+        tur   TEXT NOT NULL,
+        ip    TEXT,
+        cihaz TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )
+    """)
+
+    # ✅ ZIMMET (assets) NEW
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS assets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        item_name TEXT NOT NULL,
+        item_props TEXT,
+        serial_no TEXT,
+        assigned_at TEXT NOT NULL,
+        assigned_by INTEGER,
+        returned_at TEXT,
+        returned_by INTEGER,
+        note TEXT,
+        FOREIGN KEY(user_id) REFERENCES users(id),
+        FOREIGN KEY(assigned_by) REFERENCES users(id),
+        FOREIGN KEY(returned_by) REFERENCES users(id)
+    )
+    """)
+
+    # ✅ AVANS (advances) NEW
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS advances (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        reason TEXT,
+        status TEXT NOT NULL DEFAULT 'Beklemede',
+        created_at TEXT NOT NULL,
+        decided_at TEXT,
+        decided_by INTEGER,
+        forwarded_at TEXT,
+        forwarded_by INTEGER,
+        FOREIGN KEY(user_id) REFERENCES users(id),
+        FOREIGN KEY(decided_by) REFERENCES users(id),
+        FOREIGN KEY(forwarded_by) REFERENCES users(id)
+    )
+    """)
+
+    # ✅ IT TALEP (tickets) NEW
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS it_tickets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+
+        subject TEXT NOT NULL,
+        description TEXT,
+        priority TEXT NOT NULL DEFAULT 'Orta',          -- Düşük/Orta/Yüksek/Acil
+
+        status TEXT NOT NULL DEFAULT 'Açık',            -- Açık/Beklemede/Yönlendirildi/Kapalı
+        status_note TEXT,                               -- IT açıklaması / durum notu
+
+        image_path TEXT,                                -- yüklenen resim dosya yolu
+
+        created_at TEXT NOT NULL,
+        updated_at TEXT,
+        closed_at TEXT,
+
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )
+    """)
+
+    # ✅ IT TALEP MESAJLAR (ticket_messages) NEW
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS it_ticket_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticket_id INTEGER NOT NULL,
+        author_id INTEGER NOT NULL,                     -- mesajı yazan (IT veya talep sahibi)
+        message TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+
+        FOREIGN KEY(ticket_id) REFERENCES it_tickets(id),
+        FOREIGN KEY(author_id) REFERENCES users(id)
+    )
+    """)
+
+
+    # Migrations (older db -> add missing columns safely)
+    for col, ddl in [
+        ("email", "ALTER TABLE users ADD COLUMN email TEXT"),
+        ("manager_id", "ALTER TABLE users ADD COLUMN manager_id INTEGER"),
+        ("responsible_id", "ALTER TABLE users ADD COLUMN responsible_id INTEGER"),  # ✅ NEW
+        ("hire_date", "ALTER TABLE users ADD COLUMN hire_date TEXT"),
+        ("annual_leave_days", "ALTER TABLE users ADD COLUMN annual_leave_days INTEGER NOT NULL DEFAULT 14"),
+        ("can_qr", "ALTER TABLE users ADD COLUMN can_qr INTEGER NOT NULL DEFAULT 0"),
+        ("qr_secret", "ALTER TABLE users ADD COLUMN qr_secret TEXT"),
+    ]:
+        if not table_has_column(conn, "users", col):
+            conn.execute(ddl)
+
+    for col, ddl in [
+        ("decided_at", "ALTER TABLE leave_requests ADD COLUMN decided_at TEXT"),
+        ("decided_by", "ALTER TABLE leave_requests ADD COLUMN decided_by INTEGER"),
+        ("pending_with", "ALTER TABLE leave_requests ADD COLUMN pending_with INTEGER"),  # ✅ NEW
+        ("stage", "ALTER TABLE leave_requests ADD COLUMN stage TEXT"),                  # ✅ NEW
+    ]:
+        if not table_has_column(conn, "leave_requests", col):
+            conn.execute(ddl)
+
+    conn.commit()
+    conn.close()
+
+def ensure_default_owner():
+    row = query_one("SELECT COUNT(*) as c FROM users")
+    if row and row["c"] == 0:
+        owner_user = os.environ.get("IK_OWNER_USER", "admin")
+        owner_pass = os.environ.get("IK_OWNER_PASS", "Admin123!")
+        owner_name = os.environ.get("IK_OWNER_NAME", "Patron")
+        owner_mail = os.environ.get("IK_OWNER_EMAIL", "")
+
+        exec_sql("""
+        INSERT INTO users (full_name, username, password_hash, role, is_active, email, annual_leave_days, can_qr, qr_secret)
+        VALUES (?, ?, ?, ?, 1, ?, 14, 1, ?)
+        """, (
+            owner_name,
+            owner_user.lower().strip(),
+            generate_password_hash(owner_pass),
+            ROLE_OWNER,
+            owner_mail,
+            secrets.token_hex(8)
+        ))
+
+
+# -----------------------------
+# Auth & RBAC
+# -----------------------------
+def current_user():
+    uid = session.get("uid")
+    if not uid:
+        return None
+    return query_one("SELECT * FROM users WHERE id=? AND is_active=1", (uid,))
+
+def login_required(fn):
+    def wrapper(*args, **kwargs):
+        if not current_user():
+            return redirect(url_for("login", next=request.path))
+        return fn(*args, **kwargs)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+def role_required(*roles):
+    def deco(fn):
+        def wrapper(*args, **kwargs):
+            u = current_user()
+            if not u:
+                return redirect(url_for("login", next=request.path))
+            if u["role"] not in roles:
+                abort(403)
+            return fn(*args, **kwargs)
+        wrapper.__name__ = fn.__name__
+        return wrapper
+    return deco
+
+
+# -----------------------------
+# Mail
+# -----------------------------
+def send_mail(to_email: str, subject: str, body_html: str):
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        return
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = MAIL_FROM
+        msg["To"] = to_email
+
+        msg.attach(MIMEText(body_html, "html", "utf-8"))
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.sendmail(MAIL_FROM, [to_email], msg.as_string())
+
+    except Exception as e:
+        # Mail atılamadı diye izin talebi/işlem çökmesin
+        try:
+            app.logger.exception("Mail gönderilemedi: %s", e)
+        except Exception:
+            print("Mail gönderilemedi:", e)
+        return
+
+
+def send_mail_many(to_addrs, subject: str, body: str):
+    if not to_addrs:
+        return
+    for a in to_addrs:
+        try:
+            send_mail(a, subject, body)
+        except Exception:
+            pass
+
+def get_owner_email():
+    r = query_one("SELECT email FROM users WHERE role=? AND is_active=1 ORDER BY id ASC LIMIT 1", (ROLE_OWNER,))
+    return (r["email"] if r else "") or ""
+
+def get_accounting_emails():
+    rows = query_all("SELECT email FROM users WHERE role=? AND is_active=1 AND email IS NOT NULL AND email!=''", (ROLE_ACCOUNTING,))
+    return [r["email"] for r in rows]
+
+def get_it_emails():
+    rows = query_all(
+        "SELECT email FROM users WHERE role=? AND is_active=1 AND email IS NOT NULL AND email!=''",
+        (ROLE_IT,)
+    )
+    return [r["email"] for r in rows]
+
+
+def get_user_email(user_id: int):
+    r = query_one("SELECT email FROM users WHERE id=? AND is_active=1", (user_id,))
+    return (r["email"] if r else "") or ""
+
+
+# -----------------------------
+# UI (light corporate)
+# -----------------------------
+def html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+# ✅ Mail helpers (ŞIK / ALT ALTA)
+def nl2br(s: str) -> str:
+    return html_escape(s).replace("\n", "<br>")
+
+def ik_mail_template(title: str, intro: str, rows: list, stage_text: str = "", button_text: str = "", button_url: str = "", footer: str = "İK Portal"):
+    """
+    rows: [("Etiket", "Değer (HTML olabilir)"), ...]
+    Not: rows içindeki value tarafı HTML olabilir (nl2br vb). Key tarafı escape edilir.
+    """
+    tr_html = ""
+    for k, v in rows:
+        tr_html += f"""
+        <tr>
+          <td style="padding:7px 0; color:#64748b; width:140px; vertical-align:top;">{html_escape(str(k))}</td>
+          <td style="padding:7px 0; font-weight:700;">{v}</td>
+        </tr>
+        """
+
+    stage_block = ""
+    if stage_text:
+        stage_block = f"""
+        <div style="margin-top:14px; border:1px solid #e5e7eb; border-radius:12px; padding:12px 14px; background:#ffffff;">
+          <div style="font-weight:800; margin-bottom:8px;">Onay Aşaması</div>
+          <div style="margin-bottom:10px;">
+            <span style="display:inline-block; padding:6px 12px; border-radius:999px; background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; font-weight:800;">
+              {html_escape(stage_text)}
+            </span>
+          </div>
+          {"<a href='"+html_escape(button_url)+"' style='display:inline-block; padding:10px 14px; border-radius:12px; background:#1d4ed8; color:#ffffff; font-weight:800; text-decoration:none;'>"+html_escape(button_text)+"</a>" if (button_text and button_url) else ""}
+          {("<div style='margin-top:10px; font-size:12px; color:#64748b;'>Buton çalışmazsa link: "+html_escape(button_url)+"</div>") if (button_text and button_url) else ""}
+        </div>
+        """
+
+    return f"""
+<div style="font-family:Segoe UI,Roboto,Arial; font-size:14px; color:#0f172a; background:#f6f8fc; padding:16px 0;">
+  <div style="max-width:680px; margin:0 auto; border:1px solid #e5e7eb; border-radius:14px; overflow:hidden; background:#ffffff;">
+    <div style="background:#1d4ed8; color:white; padding:16px 18px;">
+      <div style="font-size:16px; font-weight:900; letter-spacing:.2px;">{html_escape(APP_TITLE)}</div>
+      <div style="opacity:.92; margin-top:4px;">{html_escape(title)}</div>
+    </div>
+
+    <div style="padding:18px;">
+      <p style="margin:0 0 10px 0;">Merhaba,</p>
+      <p style="margin:0 0 14px 0; color:#334155;">{html_escape(intro)}</p>
+
+      <div style="border:1px solid #e5e7eb; border-radius:12px; padding:12px 14px; background:#f8fafc;">
+        <div style="font-weight:900; margin-bottom:8px;">Talep Bilgileri</div>
+        <table style="width:100%; border-collapse:collapse; font-size:14px;">
+          {tr_html}
+        </table>
+      </div>
+
+      {stage_block}
+
+      <div style="margin-top:16px; color:#94a3b8; font-size:12px;">
+        {html_escape(footer)}
+      </div>
+    </div>
+  </div>
+</div>
+"""
+
+def format_status_pill(status: str) -> str:
+    s = status or ""
+    cls = "warn"
+    if s == STATUS_APPROVED or s == ADV_STATUS_APPROVED:
+        cls = "ok"
+    elif s == STATUS_REJECTED or s == ADV_STATUS_REJECTED:
+        cls = "bad"
+    return f"<span class='pill {cls}'>{html_escape(s)}</span>"
+
+def render_page(title, body_html, user=None):
+    u = user or current_user()
+    nav = ""
+    if u:
+        nav_items = [
+            ("/", "Ana Sayfa"),
+
+        ]
+
+        # ✅ IT TALEP (Herkes kendi taleplerini görür)
+        nav_items.append(("/it/my", "IT Taleplerim"))
+        nav_items.append(("/it/new", "IT Talep Aç"))
+
+        # ✅ Patronun izin talep ekranları olmayacak
+        if u["role"] != ROLE_OWNER:
+            nav_items.append(("/leave/my", "İzinlerim"))
+            nav_items.append(("/leave/new", "İzin Talep Et"))
+
+        if u["can_qr"] == 1:
+            nav_items.append(("/qr", "QR ile Mesai"))
+
+        if u["role"] in (ROLE_OWNER, ROLE_ACCOUNTING, ROLE_MANAGER, ROLE_RESPONSIBLE):
+            nav_items.append(("/leave/admin", "İzin Yönetimi"))
+
+        if u["role"] in (ROLE_OWNER, ROLE_ACCOUNTING):
+            nav_items.append(("/attendance", "Mesai Raporu"))
+
+        if u["role"] == ROLE_RESPONSIBLE:
+            nav_items.append(("/attendance/team", "Mesai (Ekibim)"))
+
+        if u["role"] in (ROLE_OWNER, ROLE_ACCOUNTING, ROLE_MANAGER, ROLE_RESPONSIBLE):
+            nav_items.append(("/assets", "Zimmet Yönetimi"))
+
+        if u["role"] != ROLE_OWNER:
+            nav_items.append(("/advance/my", "Avanslarım"))
+            nav_items.append(("/advance/new", "Avans Talep Et"))
+
+        # ✅ IT ekibi tüm talepleri görür (admin liste)
+        if u["role"] == ROLE_IT:
+            nav_items.append(("/it/admin", "IT Talep Yönetimi"))
+
+        if u["role"] == ROLE_ACCOUNTING:
+            nav_items.append(("/advance/accounting", "Avans Yönetimi"))
+
+        if u["role"] == ROLE_OWNER:
+            nav_items.append(("/advance/owner", "Avans Onay"))
+
+        if u["role"] in (ROLE_OWNER, ROLE_ACCOUNTING):
+            nav_items.append(("/users", "Kullanıcılar"))
+
+        nav_links = "".join([f"<a class='navlink' href='{href}'>{html_escape(text)}</a>" for href, text in nav_items])
+
+        # ✅ Responsive hamburger menü (mobil)
+        nav = f"""
+        <div class="topbar">
+          <div class="brand">{APP_TITLE}</div>
+
+          <input id="navToggle" class="navToggle" type="checkbox">
+          <label class="hamburger" for="navToggle" aria-label="Menüyü Aç/Kapat">
+            <span></span><span></span><span></span>
+          </label>
+
+          <div class="nav" id="topNav">{nav_links}</div>
+
+          <div class="userbox">
+            <span class="muted userName">{html_escape(u['full_name'])}</span>
+            <a class="navlink" href="/logout">Çıkış</a>
+          </div>
+        </div>
+        """
+    else:
+        nav = f"""
+        <div class="topbar">
+          <div class="brand">{APP_TITLE}</div>
+          <div class="nav"></div>
+          <div class="userbox"></div>
+        </div>
+        """
+
+    return f"""
+    <!doctype html>
+    <html lang="tr">
+    <head>
+      <meta charset="utf-8"/>
+      <meta name="viewport" content="width=device-width, initial-scale=1"/>
+      <title>{html_escape(title)} - {APP_TITLE}</title>
+      <style>
+        :root {{
+          --bg:#f6f8fc;
+          --card:#ffffff;
+          --text:#0f172a;
+          --muted:#64748b;
+          --line:rgba(15,23,42,.10);
+          --primary:#1d4ed8;
+          --primary2:#1e40af;
+          --ok:#16a34a;
+          --bad:#dc2626;
+          --warn:#f59e0b;
+          --shadow: 0 10px 28px rgba(2,6,23,.08);
+        }}
+        *{{box-sizing:border-box}}
+        body{{margin:0;background:linear-gradient(180deg,#eef3ff,var(--bg));color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;}}
+        a{{color:var(--primary);text-decoration:none}}
+        .topbar{{
+          display:flex; gap:12px; align-items:center; justify-content:space-between;
+          padding:14px 18px; border-bottom:1px solid var(--line);
+          background:rgba(255,255,255,.85); backdrop-filter: blur(8px);
+          position:sticky; top:0; z-index:10;
+          flex-wrap:wrap; /* ✅ mobilde kırılma */
+        }}
+        .brand{{font-weight:800;letter-spacing:.2px; white-space:nowrap}}
+        .nav{{display:flex;gap:10px;flex-wrap:wrap}}
+        .navlink{{padding:8px 10px;border:1px solid var(--line);border-radius:12px;background:#fff; white-space:nowrap}}
+        .navlink:hover{{background:#f3f6ff}}
+        .userbox{{display:flex;align-items:center;gap:10px; flex-wrap:wrap; justify-content:flex-end}}
+        .container{{max-width:1100px;margin:22px auto;padding:0 14px}}
+        .card{{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;box-shadow:var(--shadow)}}
+        .grid{{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}}
+        .two{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}
+        .h1{{font-size:20px;font-weight:800;margin:0 0 10px}}
+        .muted{{color:var(--muted)}}
+        input,select,textarea{{width:100%;padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:#fff;color:var(--text);outline:none}}
+        textarea{{min-height:90px;resize:vertical}}
+        .row{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
+        .btn{{display:inline-block;padding:10px 14px;border-radius:12px;border:1px solid rgba(29,78,216,.20);background:linear-gradient(180deg,var(--primary),var(--primary2));color:white;font-weight:700;cursor:pointer}}
+        .btn:hover{{filter:brightness(1.05)}}
+        .btn2{{display:inline-block;padding:10px 14px;border-radius:12px;border:1px solid var(--line);background:#fff;color:var(--text);font-weight:700}}
+        .btn2:hover{{background:#f3f6ff}}
+
+        /* ✅ Table mobilde taşmasın: yatay kaydır */
+        table{{width:100%;border-collapse:collapse;display:block;overflow-x:auto;max-width:100%;-webkit-overflow-scrolling:touch}}
+        th,td{{border-bottom:1px solid var(--line);padding:10px 8px;text-align:left;font-size:14px;white-space:nowrap}}
+
+        .pill{{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid var(--line);background:#fff;font-size:12px}}
+        .pill.ok{{border-color:rgba(22,163,74,.25);background:rgba(22,163,74,.08);color:var(--ok)}}
+        .pill.bad{{border-color:rgba(220,38,38,.25);background:rgba(220,38,38,.08);color:var(--bad)}}
+        .pill.warn{{border-color:rgba(245,158,11,.25);background:rgba(245,158,11,.10);color:#92400e}}
+        .note{{border:1px dashed var(--line);background:#fbfdff;padding:12px;border-radius:14px}}
+
+        /* ✅ Hamburger (mobil menü) */
+        .navToggle{{display:none}}
+        .hamburger{{
+          display:none;
+          width:42px; height:38px;
+          border:1px solid var(--line);
+          border-radius:12px;
+          background:#fff;
+          align-items:center;
+          justify-content:center;
+          gap:5px;
+          cursor:pointer;
+        }}
+        .hamburger span{{
+          display:block;
+          width:18px;
+          height:2px;
+          background:rgba(15,23,42,.70);
+          border-radius:2px;
+        }}
+
+        @media (max-width:900px){{
+          .row{{grid-template-columns:1fr}}
+          .two{{grid-template-columns:1fr}}
+
+          /* menü mobilde dropdown */
+          .hamburger{{display:flex}}
+          .nav{{
+            width:100%;
+            display:none;
+            padding:10px 0 2px;
+            border-top:1px solid var(--line);
+          }}
+          .navlink{{padding:10px 12px}}
+          .navToggle:checked ~ .nav{{display:flex}}
+          .userName{{display:none}} /* çok dar ekranda isim taşmasın */
+        }}
+
+        @media (max-width:520px){{
+          .container{{margin:16px auto}}
+          .topbar{{padding:12px 12px}}
+          .brand{{font-size:14px}}
+          .btn,.btn2{{width:100%; text-align:center}}
+        }}
+      </style>
+    </head>
+    <body>
+      {nav}
+      <div class="container">
+        {body_html}
+      </div>
+    </body>
+    </html>
+    """
+
+def device_fingerprint():
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
+    if "," in ip:
+        ip = ip.split(",")[0].strip()
+    ua = request.headers.get("User-Agent", "")[:180]
+    return ip.strip(), ua.strip()
+
+
+# -----------------------------
+# Annual leave calculations
+# -----------------------------
+def days_between_inclusive(start_date: str, end_date: str) -> int:
+    d1 = datetime.strptime(start_date, "%Y-%m-%d").date()
+    d2 = datetime.strptime(end_date, "%Y-%m-%d").date()
+    if d2 < d1:
+        return 0
+    return (d2 - d1).days + 1
+
+def used_annual_leave_days(user_id: int, year: int) -> int:
+    y1 = f"{year}-01-01"
+    y2 = f"{year}-12-31"
+    rows = query_all("""
+        SELECT start_date, end_date
+        FROM leave_requests
+        WHERE user_id=?
+          AND status=?
+          AND leave_type='Yillik'
+    """, (user_id, STATUS_APPROVED))
+
+    total = 0
+    for r in rows:
+        if r["end_date"] < y1 or r["start_date"] > y2:
+            continue
+        s = max(r["start_date"], y1)
+        e = min(r["end_date"], y2)
+        total += days_between_inclusive(s, e)
+    return total
+
+def remaining_annual_leave_days(user_row, year: int) -> int:
+    annual = int(user_row["annual_leave_days"] or 0)
+    used = used_annual_leave_days(int(user_row["id"]), year)
+    rem = annual - used
+    return rem if rem > 0 else 0
+
+
+# -----------------------------
+# QR token logic
+# -----------------------------
+def make_token(qr_secret: str, d: date) -> str:
+    raw = f"{qr_secret}_{d.isoformat()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def find_user_by_token(token: str, d: date):
+    users = query_all("""
+        SELECT id, full_name, qr_secret
+        FROM users
+        WHERE is_active=1 AND can_qr=1 AND qr_secret IS NOT NULL AND qr_secret!=''
+    """)
+    for u in users:
+        expected = make_token(u["qr_secret"], d)
+        if secrets.compare_digest(expected, token):
+            return u
+    return None
+
+
+# -----------------------------
+# Attendance logic
+# -----------------------------
+def next_attendance_tur(user_id: int, tarih: str):
+    rows = query_all("SELECT tur FROM attendance WHERE user_id=? AND tarih=? ORDER BY id ASC", (user_id, tarih))
+    count = len(rows)
+    if count >= len(TUR_SEQUENCE):
+        return None
+    return TUR_SEQUENCE[count]
+
+def device_used_by_another_user_today(tarih: str, ip: str, cihaz: str, user_id: int):
+    row = query_one("""
+    SELECT a.user_id, u.full_name
+    FROM attendance a
+    JOIN users u ON u.id=a.user_id
+    WHERE a.tarih=? AND a.ip=? AND a.cihaz=? AND a.user_id != ?
+    LIMIT 1
+    """, (tarih, ip, cihaz, user_id))
+    return row
+
+def insert_attendance(user_id: int, tur: str, ip: str, cihaz: str):
+    now = datetime.now()
+    tarih = now.strftime("%Y-%m-%d")
+    saat = now.strftime("%H:%M")
+    exec_sql("""
+    INSERT INTO attendance (user_id, tarih, saat, tur, ip, cihaz, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (user_id, tarih, saat, tur, ip, cihaz, now.isoformat(timespec="seconds")))
+    return tarih, saat
+
+def last_attendance_dt(user_id: int):
+    row = query_one("""
+        SELECT created_at
+        FROM attendance
+        WHERE user_id=?
+        ORDER BY id DESC
+        LIMIT 1
+    """, (user_id,))
+    if not row or not row["created_at"]:
+        return None
+    try:
+        return datetime.fromisoformat(row["created_at"])
+    except Exception:
+        return None
+
+
+# -----------------------------
+# Helpers for multi-step leave approval (✅ FIX)
+# -----------------------------
+def can_act_on_leave(decider_row, leave_row) -> bool:
+    """Only the current stage owner can act (owner/accounting for OWNER stage)."""
+    if leave_row["status"] != STATUS_PENDING:
+        return False
+
+    stage = (leave_row["stage"] or "").strip() or STAGE_OWNER
+    pending_with = leave_row["pending_with"]
+
+    if stage == STAGE_RESPONSIBLE:
+        return pending_with == decider_row["id"]
+    if stage == STAGE_MANAGER:
+        return pending_with == decider_row["id"]
+    # OWNER stage:
+    if stage == STAGE_OWNER:
+        return decider_row["role"] in (ROLE_OWNER, ROLE_ACCOUNTING)
+    return False
+
+def first_leave_stage_for_requester(requester_row):
+    """
+    Personel -> varsa sorumlu, yoksa müdür, yoksa owner
+    Diğer roller -> owner
+    """
+    if requester_row["role"] == ROLE_PERSONNEL:
+        rid = requester_row["responsible_id"]
+        if rid:
+            return (STAGE_RESPONSIBLE, int(rid))
+        mid = requester_row["manager_id"]
+        if mid:
+            return (STAGE_MANAGER, int(mid))
+        return (STAGE_OWNER, None)
+    return (STAGE_OWNER, None)
+
+def next_leave_stage_after_responsible(requester_row):
+    """
+    Sorumlu onayından sonra:
+    - Müdür varsa müdüre
+    - Yoksa owner'a
+    """
+    mid = requester_row["manager_id"]
+    if mid:
+        return (STAGE_MANAGER, int(mid))
+    return (STAGE_OWNER, None)
+
+def stage_label(stage: str) -> str:
+    s = (stage or "").strip() or STAGE_OWNER
+    if s == STAGE_RESPONSIBLE:
+        return "Sorumlu Onayı"
+    if s == STAGE_MANAGER:
+        return "Müdür Onayı"
+    if s == STAGE_OWNER:
+        return "Patron/Muhasebe Onayı"
+    return s
+
+
+# -----------------------------
+# Routes
+# -----------------------------
+@app.route("/health")
+def health():
+    return "OK"
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip().lower()
+        password = (request.form.get("password") or "").strip()
+        u = query_one("SELECT * FROM users WHERE username=? AND is_active=1", (username,))
+        if u and check_password_hash(u["password_hash"], password):
+            session["uid"] = u["id"]
+            nxt = request.args.get("next") or "/"
+            return redirect(nxt)
+        body = """
+        <div class="card" style="max-width:520px;margin:0 auto;">
+          <h1 class="h1">Giriş</h1>
+          <div class="pill bad">Hatalı kullanıcı adı veya şifre</div>
+          <div style="margin-top:12px"><a class="btn2" href="/login">Tekrar Dene</a></div>
+        </div>
+        """
+        return render_page("Giriş", body, user=None)
+
+    body = """
+    <div class="card" style="max-width:520px;margin:0 auto;">
+      <h1 class="h1">İK Portal Giriş</h1>
+      <p class="muted">Kullanıcı adınız ve şifrenizle giriş yapın.</p>
+      <form method="post">
+        <div class="row">
+          <div>
+            <label class="muted">Kullanıcı Adı</label>
+            <input name="username" autocomplete="username" required>
+          </div>
+          <div>
+            <label class="muted">Şifre</label>
+            <input name="password" type="password" autocomplete="current-password" required>
+          </div>
+        </div>
+        <div style="margin-top:12px">
+          <button class="btn" type="submit">Giriş Yap</button>
+        </div>
+      </form>
+      <div class="note" style="margin-top:14px">
+        <div class="muted">Sorun yaşarsanız yetkili birimle iletişime geçin.</div>
+      </div>
+    </div>
+    """
+    return render_page("Giriş", body, user=None)
+
+# -----------------------------
+# ✅ IT TALEP (NEW)
+# -----------------------------
+IT_PRIORITIES = ["Düşük", "Orta", "Yüksek", "Acil"]
+IT_STATUSES = ["Açık", "Beklemede", "Yönlendirildi", "Kapalı"]
+
+
+def _can_view_ticket(u, ticket_row) -> bool:
+    if not u or not ticket_row:
+        return False
+    if u["role"] == ROLE_IT:
+        return True
+    return int(ticket_row["user_id"]) == int(u["id"])
+
+
+@app.route("/it/new", methods=["GET", "POST"])
+@login_required
+def it_new():
+    u = current_user()
+
+    # GET -> form
+    if request.method != "POST":
+        body = f"""
+        <div class="card">
+          <h3>Yeni IT Talebi</h3>
+
+          <form method="post" enctype="multipart/form-data">
+            <div>
+              <label class="muted">Konu</label>
+              <input name="subject" required>
+            </div>
+
+            <div style="margin-top:10px">
+              <label class="muted">Öncelik</label>
+              <select name="priority">
+                {''.join(f"<option>{p}</option>" for p in IT_PRIORITIES)}
+              </select>
+            </div>
+
+            <div style="margin-top:10px">
+              <label class="muted">Açıklama</label>
+              <textarea name="description"></textarea>
+            </div>
+
+            <div style="margin-top:10px">
+              <label class="muted">Ekran Görüntüsü (opsiyonel)</label>
+              <input type="file" name="image" accept="image/*">
+            </div>
+
+            <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
+              <button class="btn" type="submit">Talep Oluştur</button>
+              <a class="btn2" href="/it/my">İptal</a>
+            </div>
+          </form>
+        </div>
+        """
+        return render_page("IT Talep Aç", body, user=u)
+
+    # POST -> create
+    subject = (request.form.get("subject") or "").strip()
+    description = (request.form.get("description") or "").strip()
+    priority = (request.form.get("priority") or "Orta").strip()
+    if priority not in IT_PRIORITIES:
+        priority = "Orta"
+
+    if not subject:
+        body = "<div class='card'><div class='pill bad'>Konu boş olamaz.</div><div style='margin-top:10px'><a class='btn2' href='/it/new'>Geri</a></div></div>"
+        return render_page("IT Talep Aç", body, user=u)
+
+    image = request.files.get("image")
+    image_path = None
+
+    if image and image.filename:
+        if not allowed_image(image.filename):
+            body = "<div class='card'><div class='pill bad'>Geçersiz resim formatı. (png/jpg/jpeg/webp)</div><div style='margin-top:10px'><a class='btn2' href='/it/new'>Geri</a></div></div>"
+            return render_page("IT Talep Aç", body, user=u)
+
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        filename = secure_filename(image.filename)
+        filename = f"{u['id']}_{int(time.time())}_{filename}"
+        save_path = os.path.join(UPLOAD_DIR, filename)
+        image.save(save_path)
+        image_path = f"uploads/it/{filename}"
+
+    now = datetime.now().isoformat(timespec="seconds")
+    status = "Açık"
+
+    tid = exec_sql("""
+        INSERT INTO it_tickets (user_id, subject, description, priority, status, image_path, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (u["id"], subject, description, priority, status, image_path, now, now))
+
+    # --- MAIL: Yeni IT Talebi -> IT ekibi ---
+    try:
+        it_emails = get_it_emails()
+        if it_emails:
+            mail_html = ik_mail_template(
+                title="Yeni IT Talebi",
+                intro="Yeni bir IT talebi oluşturuldu.",
+                rows=[
+                    ("Talep No", str(tid)),
+                    ("Talep Eden", html_escape(u["full_name"])),
+                    ("Konu", html_escape(subject)),
+                    ("Öncelik", html_escape(priority)),
+                    ("Durum", html_escape(status)),
+                ],
+                button_text="Talebi Görüntüle",
+                button_url=f"https://ik.digiturkkibris.com/it/{tid}",
+                footer="İK Portal - IT"
+            )
+            send_mail_many(it_emails, "[IK][IT] Yeni IT Talebi", mail_html)
+    except Exception:
+        pass
+
+    return redirect("/it/my")
+
+
+@app.route("/it/<int:tid>", methods=["GET", "POST"])
+@login_required
+def it_detail(tid):
+    u = current_user()
+
+    t = query_one("""
+        SELECT it.*, us.full_name AS owner_name
+        FROM it_tickets it
+        JOIN users us ON us.id = it.user_id
+        WHERE it.id = ?
+    """, (tid,))
+    if not t:
+        abort(404)
+
+    if not _can_view_ticket(u, t):
+        abort(403)
+
+    # POST: Mesaj ekleme
+    if request.method == "POST":
+        msg = (request.form.get("message") or "").strip()
+        if msg:
+            now = datetime.now().isoformat(timespec="seconds")
+            exec_sql("""
+                INSERT INTO it_ticket_messages (ticket_id, author_id, message, created_at)
+                VALUES (?, ?, ?, ?)
+            """, (tid, u["id"], msg, now))
+            exec_sql("UPDATE it_tickets SET updated_at=? WHERE id=?", (now, tid))
+
+            # --- MAIL: Mesaj Bildirimi ---
+            try:
+                if u["role"] == ROLE_IT:
+                    # IT yazdı -> talep sahibine
+                    owner_email = get_user_email(int(t["user_id"]))
+                    if owner_email:
+                        mail_html = ik_mail_template(
+                            title="IT Talebinize Yanıt Var",
+                            intro="IT tarafından talebinize yeni bir mesaj yazıldı.",
+                            rows=[
+                                ("Talep No", str(tid)),
+                                ("Konu", html_escape(t["subject"])),
+                                ("Mesaj", nl2br(msg)),
+                            ],
+                            button_text="Talebi Aç",
+                            button_url=f"https://ik.digiturkkibris.com/it/{tid}",
+                            footer="İK Portal - IT"
+                        )
+                        send_mail(owner_email, "[IK][IT] Talebinize Yanıt", mail_html)
+                else:
+                    # Personel yazdı -> IT ekibine
+                    it_emails = get_it_emails()
+                    if it_emails:
+                        mail_html = ik_mail_template(
+                            title="IT Talebine Yeni Mesaj",
+                            intro="Bir IT talebine yeni mesaj eklendi.",
+                            rows=[
+                                ("Talep No", str(tid)),
+                                ("Talep Eden", html_escape(t["owner_name"])),
+                                ("Mesaj", nl2br(msg)),
+                            ],
+                            button_text="Talebi Aç",
+                            button_url=f"https://ik.digiturkkibris.com/it/{tid}",
+                            footer="İK Portal - IT"
+                        )
+                        send_mail_many(it_emails, "[IK][IT] Yeni Mesaj", mail_html)
+            except Exception:
+                pass
+
+        return redirect(f"/it/{tid}")
+
+    # Mesajları çek
+    msgs = query_all("""
+        SELECT m.*, u.full_name AS author_name, u.role AS author_role
+        FROM it_ticket_messages m
+        JOIN users u ON u.id = m.author_id
+        WHERE m.ticket_id = ?
+        ORDER BY m.id ASC
+    """, (tid,))
+
+    msgs_html = ""
+    for m in msgs:
+        rolepill = f"<span class='pill'>{html_escape(m['author_role'])}</span>"
+        msgs_html += f"""
+        <div class="note" style="margin-top:10px">
+          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+            <b>{html_escape(m['author_name'])}</b> {rolepill}
+            <span class="muted">{html_escape((m['created_at'] or '')[:19].replace("T"," "))}</span>
+          </div>
+          <div style="margin-top:8px">{nl2br(m['message'])}</div>
+        </div>
+        """
+
+    if not msgs_html:
+        msgs_html = "<div class='muted'>Henüz mesaj yok.</div>"
+
+    # Görsel
+    img_html = ""
+    image_path = t["image_path"] if t["image_path"] else ""
+    if image_path:
+        safe_path = html_escape(image_path)
+        img_html = f"""
+        <div style="margin-top:12px">
+          <div class="muted" style="margin-bottom:6px">Ekran Görüntüsü</div>
+          <a href="/uploads/{safe_path.replace('uploads/','')}" target="_blank">
+            <img src="/uploads/{safe_path.replace('uploads/','')}"
+                 alt="Ekran Görüntüsü"
+                 style="max-width:100%;border-radius:12px;border:1px solid rgba(0,0,0,.08)">
+          </a>
+        </div>
+        """
+
+    # IT ise durum güncelleme kutusu
+    it_admin_box = ""
+    if u["role"] == ROLE_IT:
+        status_opts = "".join([
+            f"<option value='{html_escape(s)}' {'selected' if (t['status']==s) else ''}>{html_escape(s)}</option>"
+            for s in IT_STATUSES
+        ])
+        it_admin_box = f"""
+        <div class="note" style="margin-top:14px">
+          <b>IT İşlemi</b>
+          <form method="post" action="/it/{tid}/update" style="margin-top:10px">
+            <div class="row">
+              <div>
+                <label class="muted">Durum</label>
+                <select name="status">{status_opts}</select>
+              </div>
+              <div>
+                <label class="muted">Durum Notu (IT)</label>
+                <input name="status_note" value="{html_escape(t['status_note'] or '')}" placeholder="Kısa not...">
+              </div>
+            </div>
+            <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap">
+              <button class="btn" type="submit">Güncelle</button>
+              <a class="btn2" href="/it/admin">Listeye Dön</a>
+            </div>
+          </form>
+        </div>
+        """
+
+    body = f"""
+    <div class="card">
+      <h1 class="h1">IT Talep #{t['id']}</h1>
+      <div class="two" style="margin-top:10px">
+        <div class="note">
+          <div class="muted">Talep Sahibi</div>
+          <div><b>{html_escape(t['owner_name'])}</b></div>
+          <div class="muted" style="margin-top:6px">Oluşturma: {html_escape((t['created_at'] or '')[:19].replace("T"," "))}</div>
+          <div class="muted">Güncelleme: {html_escape((t['updated_at'] or '')[:19].replace("T"," ")) if t['updated_at'] else "—"}</div>
+        </div>
+        <div class="note">
+          <div class="muted">Durum / Öncelik</div>
+          <div style="margin-top:6px">Durum: {format_status_pill(t['status'])}</div>
+          <div style="margin-top:6px">Öncelik: <span class="pill">{html_escape(t['priority'])}</span></div>
+          <div style="margin-top:6px" class="muted">IT Notu: {html_escape(t['status_note'] or '-')}</div>
+        </div>
+      </div>
+
+      <div class="note" style="margin-top:14px">
+        <div class="muted">Konu</div>
+        <div style="font-weight:800; margin-top:6px">{html_escape(t['subject'])}</div>
+        <div class="muted" style="margin-top:10px">Açıklama</div>
+        <div style="margin-top:6px">{nl2br(t['description'] or '-')}</div>
+        {img_html}
+      </div>
+
+      {it_admin_box}
+
+      <div class="note" style="margin-top:14px">
+        <b>Mesajlar</b>
+        <div style="margin-top:8px">{msgs_html}</div>
+
+        <form method="post" style="margin-top:14px">
+          <label class="muted">Yeni Mesaj</label>
+          <textarea name="message" placeholder="Mesaj yaz..."></textarea>
+          <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap">
+            <button class="btn" type="submit">Mesaj Gönder</button>
+            <a class="btn2" href="/it/my">Geri</a>
+          </div>
+        </form>
+      </div>
+    </div>
+    """
+    return render_page(f"IT Talep {t['id']}", body, user=u)
+
+
+@app.route("/it/<int:tid>/update", methods=["POST"])
+@role_required(ROLE_IT)
+def it_update(tid):
+    u = current_user()
+
+    t = query_one("""
+        SELECT it.*, us.full_name AS owner_name
+        FROM it_tickets it
+        JOIN users us ON us.id = it.user_id
+        WHERE it.id=?
+    """, (tid,))
+    if not t:
+        abort(404)
+
+    new_status = (request.form.get("status") or "").strip()
+    status_note = (request.form.get("status_note") or "").strip()
+
+    if new_status not in IT_STATUSES:
+        new_status = t["status"]
+
+    now = datetime.now().isoformat(timespec="seconds")
+    closed_at = now if new_status == "Kapalı" else None
+
+    exec_sql("""
+        UPDATE it_tickets
+        SET status=?, status_note=?, updated_at=?, closed_at=COALESCE(?, closed_at)
+        WHERE id=?
+    """, (new_status, status_note, now, closed_at, tid))
+
+    # --- MAIL: Durum güncelleme -> talep sahibine ---
+    try:
+        owner_email = get_user_email(int(t["user_id"]))
+        if owner_email:
+            mail_html = ik_mail_template(
+                title="IT Talebiniz Güncellendi",
+                intro="IT talebinizin durumu güncellendi.",
+                rows=[
+                    ("Talep No", str(tid)),
+                    ("Konu", html_escape(t["subject"])),
+                    ("Yeni Durum", html_escape(new_status)),
+                    ("IT Notu", html_escape(status_note or "-")),
+                ],
+                button_text="Talebi Görüntüle",
+                button_url=f"https://ik.digiturkkibris.com/it/{tid}",
+                footer="İK Portal - IT"
+            )
+            send_mail(owner_email, "[IK][IT] Talep Durumu Güncellendi", mail_html)
+    except Exception:
+        pass
+
+    return redirect(f"/it/{tid}")
+
+
+@app.route("/it/my")
+@login_required
+def it_my():
+    u = current_user()
+
+    rows = query_all("""
+        SELECT id, subject, priority, status, created_at
+        FROM it_tickets
+        WHERE user_id = ?
+        ORDER BY id DESC
+    """, (u["id"],))
+
+    trs = ""
+    for r in rows:
+        trs += f"""
+        <tr>
+          <td>{r['id']}</td>
+          <td>{html_escape(r['subject'])}</td>
+          <td><span class="pill">{html_escape(r['priority'])}</span></td>
+          <td>{format_status_pill(r['status'])}</td>
+          <td class="muted">{html_escape((r['created_at'] or '')[:19].replace("T"," "))}</td>
+          <td><a class="btn2" href="/it/{r['id']}">Detay</a></td>
+        </tr>
+        """
+
+    if not trs:
+        trs = "<tr><td colspan='6' class='muted'>Henüz IT talebiniz yok.</td></tr>"
+
+    body = f"""
+    <div class="card">
+      <h1 class="h1">IT Taleplerim</h1>
+      <div style="margin-bottom:12px">
+        <a class="btn" href="/it/new">Yeni IT Talebi Aç</a>
+      </div>
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Konu</th><th>Öncelik</th><th>Durum</th><th>Oluşturma</th><th></th></tr>
+        </thead>
+        <tbody>{trs}</tbody>
+      </table>
+      <div class="note" style="margin-top:14px">
+        <div class="muted">Bu ekranda sadece size ait IT talepleri listelenir.</div>
+      </div>
+    </div>
+    """
+    return render_page("IT Taleplerim", body, user=u)
+
+
+@app.route("/it/admin")
+@role_required(ROLE_IT)
+def it_admin():
+    rows = query_all("""
+        SELECT it.id, it.subject, it.priority, it.status,
+               it.created_at, it.updated_at,
+               u.full_name AS owner_name
+        FROM it_tickets it
+        JOIN users u ON u.id = it.user_id
+        ORDER BY it.id DESC
+    """)
+
+    trs = ""
+    for r in rows:
+        trs += f"""
+        <tr>
+          <td>{r['id']}</td>
+          <td>{html_escape(r['subject'])}</td>
+          <td>{html_escape(r['owner_name'])}</td>
+          <td><span class="pill">{html_escape(r['priority'])}</span></td>
+          <td>{format_status_pill(r['status'])}</td>
+          <td class="muted">{html_escape((r['created_at'] or '')[:19].replace("T"," "))}</td>
+          <td><a class="btn2" href="/it/{r['id']}">Detay</a></td>
+        </tr>
+        """
+
+    if not trs:
+        trs = "<tr><td colspan='7' class='muted'>Henüz talep yok.</td></tr>"
+
+    body = f"""
+    <div class="card">
+      <h1 class="h1">IT Talep Yönetimi</h1>
+      <div style="margin-bottom:12px;display:flex;gap:10px;flex-wrap:wrap">
+        <a class="btn" href="/it/admin.xlsx">Excel İndir</a>
+      </div>
+
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Konu</th><th>Açan</th><th>Öncelik</th><th>Durum</th><th>Oluşturma</th><th></th></tr>
+        </thead>
+        <tbody>{trs}</tbody>
+      </table>
+
+      <div class="note" style="margin-top:14px">
+        <div class="muted">Bu ekran sadece IT ekibi tarafından görüntülenebilir.</div>
+      </div>
+    </div>
+    """
+    return render_page("IT Talep Yönetimi", body, user=current_user())
+
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+@app.route("/uploads/<path:filename>")
+@login_required
+def uploads_serve(filename):
+    """
+    Güvenli şekilde uploads altından dosya servis eder.
+    Sadece uploads/ içinden izin verir (path traversal engeli).
+    """
+    base_dir = os.path.join(os.path.dirname(__file__), "uploads")
+    safe_path = os.path.normpath(filename).lstrip("/")
+
+    full_path = os.path.join(base_dir, safe_path)
+
+    # Path traversal engeli: full_path mutlaka base_dir altında olmalı
+    if not os.path.abspath(full_path).startswith(os.path.abspath(base_dir) + os.sep):
+        abort(403)
+
+    if not os.path.exists(full_path) or not os.path.isfile(full_path):
+        abort(404)
+
+    return send_file(full_path)
+
+
+@app.route("/")
+@login_required
+def index():
+    u = current_user()
+    today = date.today().isoformat()
+    year = date.today().year
+    used = used_annual_leave_days(int(u["id"]), year)
+    remaining = remaining_annual_leave_days(u, year)
+
+    my_leave = query_all("""
+      SELECT * FROM leave_requests
+      WHERE user_id=?
+      ORDER BY id DESC
+      LIMIT 5
+    """, (u["id"],))
+
+    my_att = query_all("""
+      SELECT * FROM attendance
+      WHERE user_id=? AND tarih=?
+      ORDER BY id ASC
+    """, (u["id"], today))
+
+    att_html = "<div class='muted'>Bugün kayıt yok.</div>"
+    if my_att:
+        rows = "".join([f"<tr><td>{html_escape(r['saat'])}</td><td>{html_escape(TUR_LABEL.get(r['tur'], r['tur']))}</td></tr>" for r in my_att])
+        att_html = f"<table><thead><tr><th>Saat</th><th>İşlem</th></tr></thead><tbody>{rows}</tbody></table>"
+
+    leave_html = "<div class='muted'>Henüz izin talebiniz yok.</div>"
+    if my_leave:
+        rows = "".join([
+            f"<tr><td>{html_escape(r['start_date'])}</td><td>{html_escape(r['end_date'])}</td><td>{html_escape(r['leave_type'])}</td><td>{format_status_pill(r['status'])}</td></tr>"
+            for r in my_leave
+        ])
+        leave_html = f"<table><thead><tr><th>Başlangıç</th><th>Bitiş</th><th>Tür</th><th>Durum</th></tr></thead><tbody>{rows}</tbody></table>"
+
+    qr_card = ""
+    if u["can_qr"] == 1:
+        qr_card = """
+        <div class="card">
+          <h2 class="h1">Mesai (QR)</h2>
+          <p class="muted">Telefon kameranızla okutmak için QR ekranını açın.</p>
+          <a class="btn" href="/qr">QR ile Mesai</a>
+        </div>
+        """
+
+    leave_buttons = ""
+    if u["role"] != ROLE_OWNER:
+        leave_buttons = """
+          <a class="btn" href="/leave/new">İzin Talep Et</a>
+          <a class="btn2" href="/leave/my">İzinlerim</a>
+        """
+
+    body = f"""
+    <div class="two">
+      <div class="card">
+        <h1 class="h1">Hoş geldin, {html_escape(u['full_name'])}</h1>
+        <div class="muted">Bugün: {today}</div>
+        <div style="margin-top:10px" class="pill">
+          {year} Yıllık İzin: <b>{remaining}</b> gün kaldı (kullanılan: {used})
+        </div>
+        <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
+          {leave_buttons}
+        </div>
+      </div>
+      {qr_card}
+    </div>
+
+    <div class="two" style="margin-top:14px">
+      <div class="card">
+        <h2 class="h1">Bugünkü Mesai Kayıtlarım</h2>
+        {att_html}
+      </div>
+      <div class="card">
+        <h2 class="h1">Son İzin Taleplerim</h2>
+        {leave_html}
+      </div>
+    </div>
+    """
+    return render_page("Ana Sayfa", body, user=u)
+
+
+# -----------------------------
+# Leave (personnel)
+# -----------------------------
+@app.route("/leave/my")
+@login_required
+def leave_my():
+    u = current_user()
+
+    if u["role"] == ROLE_OWNER:
+        return render_page("İzinlerim", "<div class='card'><div class='pill warn'>Patron için izin talep/izinler ekranı kullanılmaz.</div></div>", user=u)
+
+    rows = query_all("""
+      SELECT * FROM leave_requests
+      WHERE user_id=?
+      ORDER BY id DESC
+    """, (u["id"],))
+
+    trs = ""
+    for r in rows:
+        trs += f"""
+        <tr>
+          <td>{html_escape(r['start_date'])}</td>
+          <td>{html_escape(r['end_date'])}</td>
+          <td>{html_escape(r['leave_type'])}</td>
+          <td>{format_status_pill(r['status'])}</td>
+          <td class="muted">{html_escape((r['created_at'][:19].replace("T"," ")) )}</td>
+        </tr>
+        """
+    if not trs:
+        trs = "<tr><td colspan='5' class='muted'>Kayıt yok.</td></tr>"
+
+    body = f"""
+    <div class="card">
+      <h1 class="h1">İzinlerim</h1>
+      <div style="margin-bottom:12px">
+        <a class="btn" href="/leave/new">Yeni Talep</a>
+      </div>
+      <table>
+        <thead><tr><th>Başlangıç</th><th>Bitiş</th><th>Tür</th><th>Durum</th><th>Oluşturma</th></tr></thead>
+        <tbody>{trs}</tbody>
+      </table>
+    </div>
+    """
+    return render_page("İzinlerim", body, user=u)
+
+@app.route("/leave/new", methods=["GET", "POST"])
+@login_required
+def leave_new():
+    u = current_user()
+
+    if u["role"] == ROLE_OWNER:
+        return render_page("İzin Talep Et", "<div class='card'><div class='pill warn'>Patron için izin talep ekranı kapalıdır.</div></div>", user=u)
+
+    if request.method == "POST":
+        start_date = (request.form.get("start_date") or "").strip()
+        end_date = (request.form.get("end_date") or "").strip()
+        leave_type = (request.form.get("leave_type") or "Yillik").strip()
+        reason = (request.form.get("reason") or "").strip()
+
+        if not start_date or not end_date:
+            return render_page("İzin Talep Et", "<div class='card'><div class='pill bad'>Tarihleri doldurun.</div></div>", user=u)
+
+        try:
+            d1 = datetime.strptime(start_date, "%Y-%m-%d").date()
+            d2 = datetime.strptime(end_date, "%Y-%m-%d").date()
+            if d2 < d1:
+                return render_page("İzin Talep Et", "<div class='card'><div class='pill bad'>Bitiş tarihi başlangıçtan küçük olamaz.</div></div>", user=u)
+        except Exception:
+            return render_page("İzin Talep Et", "<div class='card'><div class='pill bad'>Tarih formatı YYYY-MM-DD olmalı.</div></div>", user=u)
+
+        if leave_type == "Yillik":
+            year = d1.year
+            req_days = days_between_inclusive(start_date, end_date)
+            remaining = remaining_annual_leave_days(u, year)
+            if req_days > remaining:
+                return render_page(
+                    "İzin Talep Et",
+                    f"<div class='card'><div class='pill bad'>Bu yıl kalan yıllık izniniz {remaining} gün. İstediğiniz {req_days} gün.</div></div>",
+                    user=u
+                )
+
+        now = datetime.now().isoformat(timespec="seconds")
+
+        # ✅ FIX: İlk aşama (sorumlu -> müdür -> owner)
+        stage, pending_with = first_leave_stage_for_requester(u)
+
+        exec_sql("""
+        INSERT INTO leave_requests (user_id, start_date, end_date, leave_type, reason, status, created_at, pending_with, stage)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (u["id"], start_date, end_date, leave_type, reason, STATUS_PENDING, now, pending_with, stage))
+
+        # Mail ilk onaycıya
+        if stage == STAGE_RESPONSIBLE and pending_with:
+            approver_email = get_user_email(pending_with)
+        elif stage == STAGE_MANAGER and pending_with:
+            approver_email = get_user_email(pending_with)
+        else:
+            approver_email = get_owner_email()
+
+        approval_url = "https://ik.digiturkkibris.com/leave/admin"
+        mail_html = ik_mail_template(
+            title="Onay Bekleyen İzin Talebi",
+            intro="Yeni bir izin talebi oluşturuldu. Detaylar aşağıdadır.",
+            rows=[
+                ("Talep Eden", f"{html_escape(u['full_name'])} ({html_escape(u['role'])})"),
+                ("Tarih", f"{html_escape(start_date)} → {html_escape(end_date)}"),
+                ("Tür", html_escape(leave_type)),
+                ("Açıklama", nl2br(reason or "-")),
+            ],
+            stage_text=stage_label(stage),
+            button_text="Onay / Red için Aç",
+            button_url=approval_url,
+            footer="İK Portal"
+        )
+
+        send_mail(
+            approver_email,
+            "[IK] Onay Bekleyen İzin Talebi",
+            mail_html
+        )
+
+        return redirect("/leave/my")
+
+    body = """
+    <div class="card" style="max-width:720px;">
+      <h1 class="h1">İzin Talep Et</h1>
+      <form method="post">
+        <div class="row">
+          <div>
+            <label class="muted">Başlangıç (YYYY-MM-DD)</label>
+            <input name="start_date" placeholder="2026-02-02" required>
+          </div>
+          <div>
+            <label class="muted">Bitiş (YYYY-MM-DD)</label>
+            <input name="end_date" placeholder="2026-02-03" required>
+          </div>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <div>
+            <label class="muted">İzin Türü</label>
+            <select name="leave_type">
+              <option>Yillik</option>
+              <option>Rapor</option>
+              <option>Mazeret</option>
+              <option>Ucretsiz</option>
+            </select>
+          </div>
+          <div></div>
+        </div>
+        <div style="margin-top:12px">
+          <label class="muted">Açıklama</label>
+          <textarea name="reason" placeholder="Kısa açıklama..."></textarea>
+        </div>
+        <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn" type="submit">Talep Gönder</button>
+          <a class="btn2" href="/leave/my">İptal</a>
+        </div>
+      </form>
+      <div class="note" style="margin-top:14px">
+        <div class="muted">Talebiniz önce sorumlunuza (varsa), sonra müdüre (varsa), ardından patron/muhasebe onayına gider.</div>
+      </div>
+    </div>
+    """
+    return render_page("İzin Talep Et", body, user=u)
+
+
+# -----------------------------
+# Leave admin (manager/accounting/owner/responsible)
+# -----------------------------
+@app.route("/leave/admin")
+@role_required(ROLE_OWNER, ROLE_ACCOUNTING, ROLE_MANAGER, ROLE_RESPONSIBLE)
+def leave_admin():
+    u = current_user()
+
+    rows = query_all("""
+    SELECT lr.*, us.full_name, us.role AS user_role
+    FROM leave_requests lr
+    JOIN users us ON us.id=lr.user_id
+    ORDER BY lr.id DESC
+    """)
+
+    trs = ""
+    for r in rows:
+        stage = (r["stage"] or "").strip() or STAGE_OWNER
+        pending_with = r["pending_with"]
+
+        actions = ""
+        if can_act_on_leave(u, r):
+            actions = f"""
+              <a class="btn2" href="/leave/admin/{r['id']}/approve">Onayla</a>
+              <a class="btn2" href="/leave/admin/{r['id']}/reject">Reddet</a>
+            """
+        else:
+            actions = "<span class='muted'>—</span>"
+
+        stage_info = f"<span class='pill'>{html_escape(stage_label(stage))}</span>"
+        if pending_with:
+            pw = query_one("SELECT full_name FROM users WHERE id=?", (pending_with,))
+            if pw:
+                stage_info += f" <span class='muted'>({html_escape(pw['full_name'])})</span>"
+
+        trs += f"""
+        <tr>
+          <td>{html_escape(r['full_name'])} <span class="pill">{html_escape(r['user_role'])}</span></td>
+          <td>{html_escape(r['start_date'])}</td>
+          <td>{html_escape(r['end_date'])}</td>
+          <td>{html_escape(r['leave_type'])}</td>
+          <td>{format_status_pill(r['status'])}</td>
+          <td>{stage_info}</td>
+          <td>{actions}</td>
+        </tr>
+        """
+    if not trs:
+        trs = "<tr><td colspan='7' class='muted'>Kayıt yok.</td></tr>"
+
+    body = f"""
+    <div class="card">
+      <h1 class="h1">İzin Yönetimi</h1>
+      <table>
+        <thead><tr><th>Personel</th><th>Başlangıç</th><th>Bitiş</th><th>Tür</th><th>Durum</th><th>Aşama</th><th>İşlem</th></tr></thead>
+        <tbody>{trs}</tbody>
+      </table>
+      <div class="note" style="margin-top:14px">
+        <div class="muted">Sorumlu onayından sonra (müdür varsa) talep müdüre düşer. Final onay/ret sonrası personele mail gider.</div>
+      </div>
+    </div>
+    """
+    return render_page("İzin Yönetimi", body, user=u)
+
+def _decide_leave(rid: int, action: str):
+    """
+    ✅ FIX: Çok aşamalı onay
+    - Sorumlu ONAY -> (müdür varsa) müdüre gönder (status değişmez)
+    - Müdür ONAY -> final ONAY
+    - Owner/Muhasebe ONAY -> final ONAY
+    - Her aşamada RED -> final RED
+    """
+    decider = current_user()
+    lr = query_one("""
+        SELECT lr.*, u.full_name, u.email, u.manager_id, u.responsible_id
+        FROM leave_requests lr
+        JOIN users u ON u.id=lr.user_id
+        WHERE lr.id=?
+    """, (rid,))
+    if not lr:
+        abort(404)
+
+    if lr["status"] != STATUS_PENDING:
+        return
+
+    if not can_act_on_leave(decider, lr):
+        abort(403)
+
+    stage = (lr["stage"] or "").strip() or STAGE_OWNER
+    now = datetime.now().isoformat(timespec="seconds")
+
+    if action == "reject":
+        exec_sql("""
+            UPDATE leave_requests
+            SET status=?, decided_at=?, decided_by=?, pending_with=NULL, stage=?
+            WHERE id=?
+        """, (STATUS_REJECTED, now, decider["id"], STAGE_DONE, rid))
+
+        requester_email = (lr["email"] or "").strip()
+        if requester_email:
+            mail_html = ik_mail_template(
+                title="İzin Talebiniz REDDEDİLDİ",
+                intro="İzin talebiniz reddedildi. Detaylar aşağıdadır.",
+                rows=[
+                    ("Tarih", f"{html_escape(lr['start_date'])} → {html_escape(lr['end_date'])}"),
+                    ("Tür", html_escape(lr["leave_type"])),
+                    ("Karar Veren", f"{html_escape(decider['full_name'])} ({html_escape(decider['role'])})"),
+                    ("Tarih/Saat", html_escape(now)),
+                ],
+                stage_text="Sonuç: RED",
+                button_text="İzinlerime Git",
+                button_url="https://ik.digiturkkibris.com/leave/my",
+                footer="İK Portal"
+            )
+            send_mail(requester_email, "[IK] İzin Talebiniz REDDEDİLDİ", mail_html)
+        return
+
+    # action == approve
+    if stage == STAGE_RESPONSIBLE:
+        requester_fake_row = {"manager_id": lr["manager_id"]}
+        next_stage, next_pending = next_leave_stage_after_responsible(requester_fake_row)
+
+        exec_sql("""
+            UPDATE leave_requests
+            SET pending_with=?, stage=?
+            WHERE id=?
+        """, (next_pending, next_stage, rid))
+
+        if next_stage == STAGE_MANAGER and next_pending:
+            to_mail = get_user_email(int(next_pending))
+        else:
+            to_mail = get_owner_email()
+
+        approval_url = "https://ik.digiturkkibris.com/leave/admin"
+        mail_html = ik_mail_template(
+            title="Onay Bekleyen İzin Talebi",
+            intro="Bir izin talebi bir sonraki aşamaya iletildi. Detaylar aşağıdadır.",
+            rows=[
+                ("Talep Eden", html_escape(lr["full_name"])),
+                ("Tarih", f"{html_escape(lr['start_date'])} → {html_escape(lr['end_date'])}"),
+                ("Tür", html_escape(lr["leave_type"])),
+                ("Önceki Onay", f"{html_escape(decider['full_name'])} ({html_escape(decider['role'])})"),
+            ],
+            stage_text=f"Yeni Aşama: {stage_label(next_stage)}",
+            button_text="Onay / Red için Aç",
+            button_url=approval_url,
+            footer="İK Portal"
+        )
+        send_mail(to_mail, "[IK] Onay Bekleyen İzin Talebi", mail_html)
+        return
+
+    if stage in (STAGE_MANAGER, STAGE_OWNER):
+        exec_sql("""
+            UPDATE leave_requests
+            SET status=?, decided_at=?, decided_by=?, pending_with=NULL, stage=?
+            WHERE id=?
+        """, (STATUS_APPROVED, now, decider["id"], STAGE_DONE, rid))
+
+        requester_email = (lr["email"] or "").strip()
+        if requester_email:
+            mail_html = ik_mail_template(
+                title="İzin Talebiniz ONAYLANDI",
+                intro="İzin talebiniz onaylandı. Detaylar aşağıdadır.",
+                rows=[
+                    ("Tarih", f"{html_escape(lr['start_date'])} → {html_escape(lr['end_date'])}"),
+                    ("Tür", html_escape(lr["leave_type"])),
+                    ("Karar Veren", f"{html_escape(decider['full_name'])} ({html_escape(decider['role'])})"),
+                    ("Tarih/Saat", html_escape(now)),
+                ],
+                stage_text="Sonuç: ONAY",
+                button_text="İzinlerime Git",
+                button_url="https://ik.digiturkkibris.com/leave/my",
+                footer="İK Portal"
+            )
+            send_mail(requester_email, "[IK] İzin Talebiniz ONAYLANDI", mail_html)
+        return
+
+@app.route("/leave/admin/<int:rid>/approve")
+@role_required(ROLE_OWNER, ROLE_ACCOUNTING, ROLE_MANAGER, ROLE_RESPONSIBLE)
+def leave_approve(rid):
+    _decide_leave(rid, "approve")
+    return redirect("/leave/admin")
+
+@app.route("/leave/admin/<int:rid>/reject")
+@role_required(ROLE_OWNER, ROLE_ACCOUNTING, ROLE_MANAGER, ROLE_RESPONSIBLE)
+def leave_reject(rid):
+    _decide_leave(rid, "reject")
+    return redirect("/leave/admin")
+
+
+# -----------------------------
+# ✅ ZIMMET YÖNETİMİ (NEW)
+# -----------------------------
+@app.route("/assets")
+@role_required(ROLE_OWNER, ROLE_ACCOUNTING, ROLE_MANAGER, ROLE_RESPONSIBLE)
+def assets_home():
+    u = current_user()
+    users = query_all("SELECT id, full_name, role FROM users WHERE is_active=1 ORDER BY full_name ASC")
+
+    trs = ""
+    for us in users:
+        cnt = query_one("SELECT COUNT(*) AS c FROM assets WHERE user_id=? AND returned_at IS NULL", (us["id"],))["c"]
+        trs += f"""
+        <tr>
+          <td>{html_escape(us['full_name'])}</td>
+          <td><span class="pill">{html_escape(us['role'])}</span></td>
+          <td class="muted">{cnt}</td>
+          <td><a class="btn2" href="/assets/user/{us['id']}">Detay</a></td>
+        </tr>
+        """
+
+    body = f"""
+    <div class="card">
+      <h1 class="h1">Zimmet Yönetimi</h1>
+      <table>
+        <thead><tr><th>Personel</th><th>Rol</th><th>Aktif Zimmet</th><th></th></tr></thead>
+        <tbody>{trs}</tbody>
+      </table>
+      <div class="note" style="margin-top:14px">
+        <div class="muted">Zimmet ekleme/çıkarma: Müdür / Muhasebe / Patron / Sorumlu yapabilir.</div>
+      </div>
+    </div>
+    """
+    return render_page("Zimmet Yönetimi", body, user=u)
+
+@app.route("/assets/user/<int:uid>")
+@role_required(ROLE_OWNER, ROLE_ACCOUNTING, ROLE_MANAGER, ROLE_RESPONSIBLE)
+def assets_user(uid):
+    u = current_user()
+    us = query_one("SELECT id, full_name, role FROM users WHERE id=? AND is_active=1", (uid,))
+    if not us:
+        abort(404)
+
+    rows = query_all("""
+    SELECT a.*, ub.full_name AS assigned_by_name
+    FROM assets a
+    LEFT JOIN users ub ON ub.id=a.assigned_by
+    WHERE a.user_id=?
+    ORDER BY a.id DESC
+    """, (uid,))
+
+    trs = ""
+    for r in rows:
+        status = "<span class='pill ok'>Aktif</span>" if not r["returned_at"] else "<span class='pill warn'>Teslim Edildi</span>"
+        returned = html_escape((r["returned_at"] or "")[:19].replace("T", " ")) if r["returned_at"] else "—"
+        actions = ""
+        if not r["returned_at"]:
+            actions = f"<a class='btn2' href='/assets/{r['id']}/return'>Teslim Al</a>"
+        else:
+            actions = "<span class='muted'>—</span>"
+
+        trs += f"""
+        <tr>
+          <td>{html_escape(r['item_name'])}</td>
+          <td class="muted">{html_escape(r['item_props'] or '')}</td>
+          <td class="muted">{html_escape(r['serial_no'] or '')}</td>
+          <td class="muted">{html_escape((r['assigned_at'][:19].replace("T"," ")))}</td>
+          <td class="muted">{html_escape(r['assigned_by_name'] or '')}</td>
+          <td>{status}</td>
+          <td class="muted">{returned}</td>
+          <td>{actions}</td>
+        </tr>
+        """
+    if not trs:
+        trs = "<tr><td colspan='8' class='muted'>Kayıt yok.</td></tr>"
+
+    body = f"""
+    <div class="card">
+      <h1 class="h1">{html_escape(us['full_name'])} - Zimmetler</h1>
+
+      <div class="note" style="margin:12px 0;">
+        <b>Yeni Zimmet Ekle</b>
+        <form method="post" action="/assets/user/{uid}/add" style="margin-top:10px">
+          <div class="row">
+            <div>
+              <label class="muted">İsim</label>
+              <input name="item_name" placeholder="Laptop / Araba / Printer ..." required>
+            </div>
+            <div>
+              <label class="muted">Seri No</label>
+              <input name="serial_no" placeholder="SN12345">
+            </div>
+          </div>
+          <div style="margin-top:10px">
+            <label class="muted">Özellik</label>
+            <input name="item_props" placeholder="Marka/Model/RAM vb...">
+          </div>
+          <div style="margin-top:10px">
+            <label class="muted">Not</label>
+            <input name="note" placeholder="İstersen not yaz...">
+          </div>
+          <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap">
+            <button class="btn" type="submit">Zimmetle</button>
+            <a class="btn2" href="/assets">Geri</a>
+          </div>
+        </form>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>İsim</th><th>Özellik</th><th>Seri No</th><th>Zimmet Tarihi</th><th>Zimmetleyen</th><th>Durum</th><th>Teslim Tarihi</th><th></th>
+          </tr>
+        </thead>
+        <tbody>{trs}</tbody>
+      </table>
+    </div>
+    """
+    return render_page("Zimmetler", body, user=u)
+
+@app.route("/assets/user/<int:uid>/add", methods=["POST"])
+@role_required(ROLE_OWNER, ROLE_ACCOUNTING, ROLE_MANAGER, ROLE_RESPONSIBLE)
+def assets_add(uid):
+    u = current_user()
+    us = query_one("SELECT id FROM users WHERE id=? AND is_active=1", (uid,))
+    if not us:
+        abort(404)
+
+    item_name = (request.form.get("item_name") or "").strip()
+    item_props = (request.form.get("item_props") or "").strip()
+    serial_no = (request.form.get("serial_no") or "").strip()
+    note = (request.form.get("note") or "").strip()
+
+    if not item_name:
+        return redirect(f"/assets/user/{uid}")
+
+    now = datetime.now().isoformat(timespec="seconds")
+    exec_sql("""
+    INSERT INTO assets (user_id, item_name, item_props, serial_no, assigned_at, assigned_by, note)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (uid, item_name, item_props, serial_no, now, u["id"], note))
+
+    return redirect(f"/assets/user/{uid}")
+
+@app.route("/assets/<int:aid>/return")
+@role_required(ROLE_OWNER, ROLE_ACCOUNTING, ROLE_MANAGER, ROLE_RESPONSIBLE)
+def assets_return(aid):
+    u = current_user()
+    a = query_one("SELECT * FROM assets WHERE id=?", (aid,))
+    if not a:
+        abort(404)
+    if a["returned_at"]:
+        return redirect(f"/assets/user/{a['user_id']}")
+
+    now = datetime.now().isoformat(timespec="seconds")
+    exec_sql("""
+    UPDATE assets
+    SET returned_at=?, returned_by=?
+    WHERE id=?
+    """, (now, u["id"], aid))
+
+    return redirect(f"/assets/user/{a['user_id']}")
+
+
+# -----------------------------
+# ✅ AVANS SİSTEMİ (NEW)
+# -----------------------------
+@app.route("/advance/my")
+@login_required
+def advance_my():
+    u = current_user()
+    if u["role"] == ROLE_OWNER:
+        return render_page("Avanslarım", "<div class='card'><div class='pill warn'>Patron için avans talep ekranı kullanılmaz.</div></div>", user=u)
+
+    rows = query_all("""
+    SELECT * FROM advances
+    WHERE user_id=?
+    ORDER BY id DESC
+    """, (u["id"],))
+
+    trs = ""
+    for r in rows:
+        created = html_escape((r["created_at"][:19].replace("T"," ")))
+        trs += f"""
+        <tr>
+          <td>{r['id']}</td>
+          <td>{html_escape(str(r['amount']))}</td>
+          <td class="muted">{html_escape(r['reason'] or '')}</td>
+          <td>{format_status_pill(r['status'])}</td>
+          <td class="muted">{created}</td>
+        </tr>
+        """
+    if not trs:
+        trs = "<tr><td colspan='5' class='muted'>Kayıt yok.</td></tr>"
+
+    body = f"""
+    <div class="card">
+      <h1 class="h1">Avanslarım</h1>
+      <div style="margin-bottom:12px;display:flex;gap:10px;flex-wrap:wrap">
+        <a class="btn" href="/advance/new">Yeni Avans Talebi</a>
+      </div>
+      <table>
+        <thead><tr><th>ID</th><th>Tutar</th><th>Açıklama</th><th>Durum</th><th>Oluşturma</th></tr></thead>
+        <tbody>{trs}</tbody>
+      </table>
+      <div class="note" style="margin-top:14px">
+        <div class="muted">Avans taleplerini sadece Muhasebe görür. Muhasebe isterse patron onayına gönderebilir yada kendi onaylayabilir.</div>
+      </div>
+    </div>
+    """
+    return render_page("Avanslarım", body, user=u)
+
+@app.route("/advance/new", methods=["GET", "POST"])
+@login_required
+def advance_new():
+    u = current_user()
+
+    if u["role"] == ROLE_OWNER:
+        return render_page("Avans Talep Et", "<div class='card'><div class='pill warn'>Patron için avans talep ekranı kapalıdır.</div></div>", user=u)
+
+    if request.method == "POST":
+        amount_raw = (request.form.get("amount") or "").strip().replace(",", ".")
+        reason = (request.form.get("reason") or "").strip()
+
+        try:
+            amount = float(amount_raw)
+        except Exception:
+            return render_page("Avans Talep Et", "<div class='card'><div class='pill bad'>Tutar sayı olmalı.</div></div>", user=u)
+
+        if amount <= 0:
+            return render_page("Avans Talep Et", "<div class='card'><div class='pill bad'>Tutar 0'dan büyük olmalı.</div></div>", user=u)
+
+        now = datetime.now().isoformat(timespec="seconds")
+        exec_sql("""
+        INSERT INTO advances (user_id, amount, reason, status, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """, (u["id"], amount, reason, ADV_STATUS_PENDING, now))
+
+        acc_emails = get_accounting_emails()
+        send_mail_many(
+            acc_emails,
+            "[IK] Yeni Avans Talebi",
+            f"Talep Eden: {u['full_name']} ({u['role']})\n"
+            f"Tutar: {amount}\n"
+            f"Açıklama: {reason}\n\n"
+            f"İncelemek için: https://ik.digiturkkibris.com/advance/accounting"
+        )
+
+        return redirect("/advance/my")
+
+    body = """
+    <div class="card" style="max-width:720px;">
+      <h1 class="h1">Avans Talep Et</h1>
+      <form method="post">
+        <div class="row">
+          <div>
+            <label class="muted">Tutar</label>
+            <input name="amount" placeholder="5000" required>
+          </div>
+          <div></div>
+        </div>
+        <div style="margin-top:12px">
+          <label class="muted">Açıklama</label>
+          <textarea name="reason" placeholder="Neden avans istiyorsunuz?"></textarea>
+        </div>
+        <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn" type="submit">Talep Gönder</button>
+          <a class="btn2" href="/advance/my">İptal</a>
+        </div>
+      </form>
+      <div class="note" style="margin-top:14px">
+        <div class="muted">Talep önce Muhasebe tarafından görülür.</div>
+      </div>
+    </div>
+    """
+    return render_page("Avans Talep Et", body, user=u)
+
+@app.route("/advance/accounting")
+@role_required(ROLE_ACCOUNTING)
+def advance_accounting():
+    u = current_user()
+    rows = query_all("""
+    SELECT a.*, us.full_name, us.role AS user_role
+    FROM advances a
+    JOIN users us ON us.id=a.user_id
+    ORDER BY a.id DESC
+    """)
+
+    trs = ""
+    for r in rows:
+        actions = ""
+        if r["status"] == ADV_STATUS_PENDING:
+            actions = f"""
+              <a class="btn2" href="/advance/{r['id']}/approve">Onayla</a>
+              <a class="btn2" href="/advance/{r['id']}/reject">Reddet</a>
+              <a class="btn2" href="/advance/{r['id']}/send_to_owner">Patrona Gönder</a>
+            """
+        elif r["status"] == ADV_STATUS_SENT_TO_OWNER:
+            actions = "<span class='muted'>Patron onayında</span>"
+        else:
+            actions = "<span class='muted'>—</span>"
+
+        trs += f"""
+        <tr>
+          <td>{r['id']}</td>
+          <td>{html_escape(r['full_name'])} <span class="pill">{html_escape(r['user_role'])}</span></td>
+          <td>{html_escape(str(r['amount']))}</td>
+          <td class="muted">{html_escape(r['reason'] or '')}</td>
+          <td>{format_status_pill(r['status'])}</td>
+          <td>{actions}</td>
+        </tr>
+        """
+
+    if not trs:
+        trs = "<tr><td colspan='6' class='muted'>Kayıt yok.</td></tr>"
+
+    body = f"""
+    <div class="card">
+      <h1 class="h1">Avans Yönetimi (Muhasebe)</h1>
+      <div style="margin:10px 0 14px;display:flex;gap:10px;flex-wrap:wrap">
+        <a class="btn2" href="/advance/accounting.xlsx">Excel İndir</a>
+      </div>
+      <table>
+        <thead><tr><th>ID</th><th>Personel</th><th>Tutar</th><th>Açıklama</th><th>Durum</th><th>İşlem</th></tr></thead>
+        <tbody>{trs}</tbody>
+      </table>
+      <div class="note" style="margin-top:14px">
+        <div class="muted">Muhasebe isterse kendi onaylar/ret eder, isterse patron onayına gönderir.</div>
+      </div>
+    </div>
+    """
+    return render_page("Avans Yönetimi", body, user=u)
+
+@app.route("/advance/accounting.xlsx")
+@role_required(ROLE_ACCOUNTING)
+def advance_accounting_xlsx():
+    rows = query_all("""
+    SELECT a.id, us.full_name, us.username, us.role AS user_role,
+           a.amount, a.reason, a.status, a.created_at, a.decided_at
+    FROM advances a
+    JOIN users us ON us.id=a.user_id
+    ORDER BY a.id DESC
+    """)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Avanslar"
+
+    ws.append([
+        "ID", "Personel", "Kullanıcı", "Rol",
+        "Tutar", "Açıklama", "Durum",
+        "Oluşturma", "Karar Tarihi"
+    ])
+
+    for r in rows:
+        ws.append([
+            r["id"],
+            r["full_name"],
+            r["username"],
+            r["user_role"],
+            r["amount"],
+            r["reason"] or "",
+            r["status"],
+            (r["created_at"] or "")[:19].replace("T", " "),
+            (r["decided_at"] or "")[:19].replace("T", " ") if r["decided_at"] else ""
+        ])
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+
+    filename = f"avanslar_accounting_{date.today().isoformat()}.xlsx"
+    return send_file(
+        bio,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=filename
+    )
+
+
+@app.route("/advance/owner")
+@role_required(ROLE_OWNER)
+def advance_owner():
+    u = current_user()
+    rows = query_all("""
+    SELECT a.*, us.full_name, us.role AS user_role
+    FROM advances a
+    JOIN users us ON us.id=a.user_id
+    WHERE a.status=?
+    ORDER BY a.id DESC
+    """, (ADV_STATUS_SENT_TO_OWNER,))
+
+    trs = ""
+    for r in rows:
+        trs += f"""
+        <tr>
+          <td>{r['id']}</td>
+          <td>{html_escape(r['full_name'])} <span class="pill">{html_escape(r['user_role'])}</span></td>
+          <td>{html_escape(str(r['amount']))}</td>
+          <td class="muted">{html_escape(r['reason'] or '')}</td>
+          <td>{format_status_pill(r['status'])}</td>
+          <td>
+            <a class="btn2" href="/advance/{r['id']}/owner_approve">Onayla</a>
+            <a class="btn2" href="/advance/{r['id']}/owner_reject">Reddet</a>
+          </td>
+        </tr>
+        """
+    if not trs:
+        trs = "<tr><td colspan='6' class='muted'>Patron onayında avans yok.</td></tr>"
+
+    body = f"""
+    <div class="card">
+      <h1 class="h1">Avans Onay (Patron)</h1>
+      <table>
+        <thead><tr><th>ID</th><th>Personel</th><th>Tutar</th><th>Açıklama</th><th>Durum</th><th>İşlem</th></tr></thead>
+        <tbody>{trs}</tbody>
+      </table>
+    </div>
+    """
+    return render_page("Avans Onay", body, user=u)
+
+def _advance_decide(adv_id: int, new_status: str, decided_by_user):
+    adv = query_one("""
+    SELECT a.*, u.full_name, u.email
+    FROM advances a
+    JOIN users u ON u.id=a.user_id
+    WHERE a.id=?
+    """, (adv_id,))
+    if not adv:
+        abort(404)
+
+    if new_status in (ADV_STATUS_APPROVED, ADV_STATUS_REJECTED):
+        if adv["status"] not in (ADV_STATUS_PENDING, ADV_STATUS_SENT_TO_OWNER):
+            return
+
+    now = datetime.now().isoformat(timespec="seconds")
+    exec_sql("""
+    UPDATE advances
+    SET status=?, decided_at=?, decided_by=?
+    WHERE id=?
+    """, (new_status, now, decided_by_user["id"], adv_id))
+
+    requester_email = (adv["email"] or "").strip()
+    if requester_email:
+        subj = f"[IK] Avans Talebiniz {('ONAYLANDI' if new_status==ADV_STATUS_APPROVED else 'REDDEDİLDİ')}"
+        body = (
+            f"Merhaba,\n\n"
+            f"Avans talebiniz sonuçlandı.\n\n"
+            f"Durum: {new_status}\n"
+            f"Tutar: {adv['amount']}\n"
+            f"Açıklama: {adv['reason']}\n\n"
+            f"Karar Veren: {decided_by_user['full_name']} ({decided_by_user['role']})\n"
+            f"Tarih/Saat: {now}\n\n"
+            f"İyi çalışmalar."
+        )
+        send_mail(requester_email, subj, body)
+
+@app.route("/advance/<int:adv_id>/approve")
+@role_required(ROLE_ACCOUNTING)
+def advance_approve(adv_id):
+    u = current_user()
+    _advance_decide(adv_id, ADV_STATUS_APPROVED, u)
+    return redirect("/advance/accounting")
+
+@app.route("/advance/<int:adv_id>/reject")
+@role_required(ROLE_ACCOUNTING)
+def advance_reject(adv_id):
+    u = current_user()
+    _advance_decide(adv_id, ADV_STATUS_REJECTED, u)
+    return redirect("/advance/accounting")
+
+@app.route("/advance/<int:adv_id>/send_to_owner")
+@role_required(ROLE_ACCOUNTING)
+def advance_send_to_owner(adv_id):
+    u = current_user()
+    adv = query_one("""
+    SELECT a.*, us.full_name, us.role AS user_role
+    FROM advances a
+    JOIN users us ON us.id=a.user_id
+    WHERE a.id=?
+    """, (adv_id,))
+    if not adv:
+        abort(404)
+
+    if adv["status"] != ADV_STATUS_PENDING:
+        return redirect("/advance/accounting")
+
+    now = datetime.now().isoformat(timespec="seconds")
+    exec_sql("""
+    UPDATE advances
+    SET status=?, forwarded_at=?, forwarded_by=?
+    WHERE id=?
+    """, (ADV_STATUS_SENT_TO_OWNER, now, u["id"], adv_id))
+
+    owner_mail = get_owner_email()
+    send_mail(
+        owner_mail,
+        "[IK] Patron Onayında Avans Talebi",
+        f"Talep Eden: {adv['full_name']} ({adv['user_role']})\n"
+        f"Tutar: {adv['amount']}\n"
+        f"Açıklama: {adv['reason']}\n\n"
+        f"Onay/Red için: https://ik.digiturkkibris.com/advance/owner"
+    )
+
+    return redirect("/advance/accounting")
+
+@app.route("/advance/<int:adv_id>/owner_approve")
+@role_required(ROLE_OWNER)
+def advance_owner_approve(adv_id):
+    u = current_user()
+    _advance_decide(adv_id, ADV_STATUS_APPROVED, u)
+    return redirect("/advance/owner")
+
+@app.route("/advance/<int:adv_id>/owner_reject")
+@role_required(ROLE_OWNER)
+def advance_owner_reject(adv_id):
+    u = current_user()
+    _advance_decide(adv_id, ADV_STATUS_REJECTED, u)
+    return redirect("/advance/owner")
+
+
+# -----------------------------
+# Users (owner only)
+# -----------------------------
+@app.route("/users")
+@role_required(ROLE_OWNER, ROLE_ACCOUNTING)
+def users_list():
+    u = current_user()
+    rows = query_all("""
+        SELECT id, full_name, username, role, is_active, can_qr, email, manager_id, responsible_id, annual_leave_days, hire_date
+        FROM users
+        ORDER BY id DESC
+    """)
+    trs = ""
+    for r in rows:
+        qr = "Evet" if r["can_qr"] == 1 else "Hayır"
+        active = "Aktif" if r["is_active"] == 1 else "Pasif"
+        trs += f"""
+        <tr>
+          <td>{r['id']}</td>
+          <td>{html_escape(r['full_name'])}</td>
+          <td>{html_escape(r['username'])}</td>
+          <td><span class="pill">{html_escape(r['role'])}</span></td>
+          <td class="muted">{active}</td>
+          <td class="muted">{html_escape(r['email'] or '')}</td>
+          <td class="muted">{r['annual_leave_days']}</td>
+          <td class="muted">{qr}</td>
+          <td><a class="btn2" href="/users/{r['id']}/edit">Düzenle</a></td>
+        </tr>
+        """
+    body = f"""
+    <div class="card">
+      <h1 class="h1">Kullanıcılar</h1>
+      <div style="margin-bottom:12px">
+        <a class="btn" href="/users/new">Yeni Kullanıcı</a>
+      </div>
+      <table>
+        <thead><tr><th>ID</th><th>Ad Soyad</th><th>Kullanıcı</th><th>Rol</th><th>Durum</th><th>Email</th><th>Yıllık Hak</th><th>QR</th><th></th></tr></thead>
+        <tbody>{trs}</tbody>
+      </table>
+      <div class="note" style="margin-top:14px">
+        <div class="muted">Personel için müdür/sorumlu seçimi ve email tanımı yapmayı unutma (mail akışı için).</div>
+      </div>
+    </div>
+    """
+    return render_page("Kullanıcılar", body, user=u)
+
+@app.route("/users/new", methods=["GET","POST"])
+@role_required(ROLE_OWNER, ROLE_ACCOUNTING)
+def users_new():
+    u = current_user()
+
+    managers = query_all("SELECT id, full_name FROM users WHERE role=? AND is_active=1 ORDER BY full_name", (ROLE_MANAGER,))
+    responsibles = query_all("SELECT id, full_name FROM users WHERE role=? AND is_active=1 ORDER BY full_name", (ROLE_RESPONSIBLE,))
+
+    if request.method == "POST":
+        full_name = (request.form.get("full_name") or "").strip()
+        username = (request.form.get("username") or "").strip().lower()
+        password = (request.form.get("password") or "").strip()
+        role = (request.form.get("role") or ROLE_PERSONNEL).strip()
+        email = (request.form.get("email") or "").strip()
+        hire_date = (request.form.get("hire_date") or "").strip()
+        annual_leave_days = int((request.form.get("annual_leave_days") or "14").strip() or "14")
+        manager_id = request.form.get("manager_id") or ""
+        manager_id = int(manager_id) if manager_id.isdigit() else None
+
+        responsible_id = request.form.get("responsible_id") or ""
+        responsible_id = int(responsible_id) if responsible_id.isdigit() else None
+
+        can_qr = 1 if (request.form.get("can_qr") == "1") else 0
+
+        if not full_name or not username or not password:
+            return render_page("Yeni Kullanıcı", "<div class='card'><div class='pill bad'>Zorunlu alanlar boş.</div></div>", user=u)
+        if role not in ALLOWED_ROLES:
+            role = ROLE_PERSONNEL
+
+        qr_secret = secrets.token_hex(8) if can_qr else ""
+        try:
+            exec_sql("""
+            INSERT INTO users (full_name, username, password_hash, role, is_active, email, manager_id, responsible_id, hire_date, annual_leave_days, can_qr, qr_secret)
+            VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                full_name, username, generate_password_hash(password), role,
+                email, manager_id, responsible_id, hire_date, annual_leave_days,
+                can_qr, qr_secret
+            ))
+        except sqlite3.IntegrityError:
+            return render_page("Yeni Kullanıcı", "<div class='card'><div class='pill bad'>Bu kullanıcı adı zaten var.</div></div>", user=u)
+
+        return redirect("/users")
+
+    mgr_opts = "<option value=''>—</option>" + "".join([f"<option value='{m['id']}'>{html_escape(m['full_name'])}</option>" for m in managers])
+    resp_opts = "<option value=''>—</option>" + "".join([f"<option value='{m['id']}'>{html_escape(m['full_name'])}</option>" for m in responsibles])
+
+    body = f"""
+    <div class="card" style="max-width:900px">
+      <h1 class="h1">Yeni Kullanıcı</h1>
+      <form method="post">
+        <div class="row">
+          <div>
+            <label class="muted">Ad Soyad</label>
+            <input name="full_name" required>
+          </div>
+          <div>
+            <label class="muted">Kullanıcı Adı</label>
+            <input name="username" required>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:12px">
+          <div>
+            <label class="muted">Şifre</label>
+            <input name="password" type="password" required>
+          </div>
+          <div>
+            <label class="muted">Rol</label>
+            <select name="role">
+              <option value="{ROLE_PERSONNEL}">personnel</option>
+              <option value="{ROLE_MANAGER}">manager</option>
+              <option value="{ROLE_RESPONSIBLE}">responsible</option>
+              <option value="{ROLE_ACCOUNTING}">accounting</option>
+              <option value="{ROLE_OWNER}">owner</option>
+              <option value="{ROLE_IT}">it</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:12px">
+          <div>
+            <label class="muted">Email (bildirim için)</label>
+            <input name="email" placeholder="personel@firma.com">
+          </div>
+          <div>
+            <label class="muted">İşe Giriş Tarihi (YYYY-MM-DD)</label>
+            <input name="hire_date" placeholder="2025-01-15">
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:12px">
+          <div>
+            <label class="muted">Yıllık İzin Hakkı (gün)</label>
+            <input name="annual_leave_days" value="14">
+          </div>
+          <div>
+            <label class="muted">Müdür (Personel için)</label>
+            <select name="manager_id">{mgr_opts}</select>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:12px">
+          <div>
+            <label class="muted">Sorumlu (Personel için)</label>
+            <select name="responsible_id">{resp_opts}</select>
+          </div>
+          <div></div>
+        </div>
+
+        <div style="margin-top:12px">
+          <label><input type="checkbox" name="can_qr" value="1"> <b>QR ile Mesai kullanabilir</b></label>
+        </div>
+
+        <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn" type="submit">Kaydet</button>
+          <a class="btn2" href="/users">İptal</a>
+        </div>
+      </form>
+    </div>
+    """
+    return render_page("Yeni Kullanıcı", body, user=u)
+
+@app.route("/users/<int:uid>/edit", methods=["GET","POST"])
+@role_required(ROLE_OWNER, ROLE_ACCOUNTING)
+def users_edit(uid):
+    u = current_user()
+    row = query_one("SELECT * FROM users WHERE id=?", (uid,))
+    if not row:
+        abort(404)
+
+    managers = query_all("SELECT id, full_name FROM users WHERE role=? AND is_active=1 ORDER BY full_name", (ROLE_MANAGER,))
+    responsibles = query_all("SELECT id, full_name FROM users WHERE role=? AND is_active=1 ORDER BY full_name", (ROLE_RESPONSIBLE,))
+
+    if request.method == "POST":
+        full_name = (request.form.get("full_name") or "").strip()
+        role = (request.form.get("role") or ROLE_PERSONNEL).strip()
+        is_active = 1 if (request.form.get("is_active") == "1") else 0
+        can_qr = 1 if (request.form.get("can_qr") == "1") else 0
+
+        email = (request.form.get("email") or "").strip()
+        hire_date = (request.form.get("hire_date") or "").strip()
+        annual_leave_days = int((request.form.get("annual_leave_days") or "14").strip() or "14")
+        manager_id = request.form.get("manager_id") or ""
+        manager_id = int(manager_id) if manager_id.isdigit() else None
+
+        responsible_id = (request.form.get("responsible_id") or "").strip()
+        responsible_id = int(responsible_id) if responsible_id.isdigit() else None
+
+        new_pass = (request.form.get("new_pass") or "").strip()
+
+        if role not in ALLOWED_ROLES:
+            role = ROLE_PERSONNEL
+
+        qr_secret = row["qr_secret"] or ""
+        if can_qr == 1 and not qr_secret:
+            qr_secret = secrets.token_hex(8)
+
+        if new_pass:
+            exec_sql("""
+            UPDATE users
+            SET full_name=?, role=?, is_active=?, email=?, manager_id=?, responsible_id=?, hire_date=?, annual_leave_days=?, can_qr=?, qr_secret=?, password_hash=?
+            WHERE id=?
+            """, (full_name, role, is_active, email, manager_id, responsible_id, hire_date, annual_leave_days, can_qr, qr_secret, generate_password_hash(new_pass), uid))
+        else:
+            exec_sql("""
+            UPDATE users
+            SET full_name=?, role=?, is_active=?, email=?, manager_id=?, responsible_id=?, hire_date=?, annual_leave_days=?, can_qr=?, qr_secret=?
+            WHERE id=?
+            """, (full_name, role, is_active, email, manager_id, responsible_id, hire_date, annual_leave_days, can_qr, qr_secret, uid))
+
+        return redirect("/users")
+
+    checked_active = "checked" if row["is_active"] == 1 else ""
+    checked_qr = "checked" if row["can_qr"] == 1 else ""
+    sel_role = row["role"]
+
+    mgr_opts = "<option value=''>—</option>"
+    for m in managers:
+        sel = "selected" if row["manager_id"] == m["id"] else ""
+        mgr_opts += f"<option value='{m['id']}' {sel}>{html_escape(m['full_name'])}</option>"
+
+    resp_opts = "<option value=''>—</option>"
+    for m in responsibles:
+        sel = "selected" if row["responsible_id"] == m["id"] else ""
+        resp_opts += f"<option value='{m['id']}' {sel}>{html_escape(m['full_name'])}</option>"
+
+    body = f"""
+    <div class="card" style="max-width:980px">
+      <h1 class="h1">Kullanıcı Düzenle</h1>
+      <form method="post">
+        <div class="row">
+          <div>
+            <label class="muted">Ad Soyad</label>
+            <input name="full_name" value="{html_escape(row['full_name'])}" required>
+          </div>
+          <div>
+            <label class="muted">Kullanıcı Adı (değiştirilemez)</label>
+            <input value="{html_escape(row['username'])}" disabled>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:12px">
+          <div>
+            <label class="muted">Rol</label>
+            <select name="role">
+              <option value="{ROLE_PERSONNEL}" {"selected" if sel_role==ROLE_PERSONNEL else ""}>personnel</option>
+              <option value="{ROLE_MANAGER}" {"selected" if sel_role==ROLE_MANAGER else ""}>manager</option>
+              <option value="{ROLE_RESPONSIBLE}" {"selected" if sel_role==ROLE_RESPONSIBLE else ""}>responsible</option>
+              <option value="{ROLE_ACCOUNTING}" {"selected" if sel_role==ROLE_ACCOUNTING else ""}>accounting</option>
+              <option value="{ROLE_OWNER}" {"selected" if sel_role==ROLE_OWNER else ""}>owner</option>
+              <option value="{ROLE_IT}" {"selected" if sel_role==ROLE_IT else ""}>it</option>
+            </select>
+          </div>
+          <div>
+            <label class="muted">Yeni Şifre (boş bırak)</label>
+            <input name="new_pass" type="password" placeholder="Yeni şifre...">
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:12px">
+          <div>
+            <label class="muted">Email</label>
+            <input name="email" value="{html_escape(row['email'] or '')}" placeholder="personel@firma.com">
+          </div>
+          <div>
+            <label class="muted">İşe Giriş Tarihi (YYYY-MM-DD)</label>
+            <input name="hire_date" value="{html_escape(row['hire_date'] or '')}" placeholder="2025-01-15">
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:12px">
+          <div>
+            <label class="muted">Yıllık İzin Hakkı (gün)</label>
+            <input name="annual_leave_days" value="{int(row['annual_leave_days'] or 14)}">
+          </div>
+          <div>
+            <label class="muted">Müdür (Personel için)</label>
+            <select name="manager_id">{mgr_opts}</select>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:12px">
+          <div>
+            <label class="muted">Sorumlu (Personel için)</label>
+            <select name="responsible_id">{resp_opts}</select>
+          </div>
+          <div></div>
+        </div>
+
+        <div style="margin-top:12px;display:flex;gap:18px;flex-wrap:wrap">
+          <label><input type="checkbox" name="is_active" value="1" {checked_active}> <b>Aktif</b></label>
+          <label><input type="checkbox" name="can_qr" value="1" {checked_qr}> <b>QR ile Mesai kullanabilir</b></label>
+        </div>
+
+        <div class="note" style="margin-top:14px">
+          <div class="muted">
+            Mail akışı için: Personel kullanıcılarında sorumlu/müdür seçili olmalı ve herkesin email alanı dolu olmalı.
+          </div>
+        </div>
+
+        <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn" type="submit">Kaydet</button>
+          <a class="btn2" href="/users">Geri</a>
+        </div>
+      </form>
+    </div>
+    """
+    return render_page("Kullanıcı Düzenle", body, user=u)
+
+
+# -----------------------------
+# QR page (only can_qr)
+# -----------------------------
+@app.route("/qr")
+@login_required
+def qr_page():
+    u = current_user()
+    if u["can_qr"] != 1:
+        abort(403)
+
+    if not u["qr_secret"]:
+        exec_sql("UPDATE users SET qr_secret=? WHERE id=?", (secrets.token_hex(8), u["id"]))
+        u = current_user()
+
+    token = make_token(u["qr_secret"], date.today())
+    base = public_base_url()
+    qr_url = f"{base}/giris/{token}"
+
+    img = qrcode.make(qr_url)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    body = f"""
+    <div class="card" style="max-width:760px;margin:0 auto;">
+      <h1 class="h1">QR ile Mesai</h1>
+      <p class="muted">Telefon kameranızla QR kodu okutun. Açılan sayfa işlemi tamamlayacak.</p>
+      <div style="display:flex;justify-content:center;margin:16px 0;">
+        <img src="data:image/png;base64,{b64}" style="width:320px;max-width:90%;border-radius:16px;border:1px solid rgba(15,23,42,.10)"/>
+      </div>
+      <div class="muted" style="text-align:center">
+        Bugün için geçerlidir: <span class="pill">{date.today().isoformat()}</span>
+      </div>
+      <div style="margin-top:14px;text-align:center">
+        <a class="btn2" href="/">Ana Sayfa</a>
+      </div>
+    </div>
+    """
+    return render_page("QR ile Mesai", body, user=u)
+
+@app.route("/giris/<token>")
+def qr_giris(token):
+    d = date.today()
+    u = find_user_by_token(token, d)
+    if not u:
+        body = """
+        <div class="card" style="max-width:720px;margin:0 auto;">
+          <h1 class="h1">Geçersiz QR</h1>
+          <div class="pill bad">QR kod geçersiz ya da süresi dolmuş.</div>
+        </div>
+        """
+        return render_page("QR", body, user=None)
+
+    ip, ua = device_fingerprint()
+    today = d.isoformat()
+
+    other = device_used_by_another_user_today(today, ip, ua, u["id"])
+    if other:
+        body = f"""
+        <div class="card" style="max-width:760px;margin:0 auto;">
+          <h1 class="h1">Cihaz Kısıtı</h1>
+          <div class="pill bad">Bu cihaz/IP bugün başka bir kullanıcı için kullanılmış.</div>
+          <p class="muted" style="margin-top:10px">
+            Mevcut kullanıcı: <b>{html_escape(other['full_name'])}</b>
+          </p>
+        </div>
+        """
+        return render_page("QR", body, user=None)
+
+    # ✅ Art arda QR okutmayı engelle (cooldown)
+    last_dt = last_attendance_dt(u["id"])
+    if last_dt:
+        diff_minutes = (datetime.now() - last_dt).total_seconds() / 60.0
+        if diff_minutes < QR_COOLDOWN_MINUTES:
+            kalan = int(QR_COOLDOWN_MINUTES - diff_minutes) + 1
+            body = f"""
+            <div class="card" style="max-width:760px;margin:0 auto;">
+              <h1 class="h1">Çok Hızlı Okutma</h1>
+              <div class="pill warn">Bu personel kısa süre önce QR okuttu.</div>
+              <p class="muted" style="margin-top:10px">
+                Lütfen <b>{kalan} dakika</b> sonra tekrar deneyin.
+              </p>
+              <p class="muted">{html_escape(u['full_name'])}</p>
+            </div>
+            """
+            return render_page("QR", body, user=None)
+
+
+    tur = next_attendance_tur(u["id"], today)
+    if not tur:
+        body = f"""
+        <div class="card" style="max-width:760px;margin:0 auto;">
+          <h1 class="h1">Tamamlandı</h1>
+          <div class="pill warn">Bugün için tüm kayıtlar zaten girilmiş.</div>
+          <p class="muted" style="margin-top:10px">{html_escape(u['full_name'])}</p>
+        </div>
+        """
+        return render_page("QR", body, user=None)
+
+    tarih, saat = insert_attendance(u["id"], tur, ip, ua)
+
+    body = f"""
+    <div class="card" style="max-width:760px;margin:0 auto;">
+      <h1 class="h1">Kayıt Alındı ✅</h1>
+      <div class="pill ok">{html_escape(u['full_name'])}</div>
+      <div style="margin-top:12px" class="muted">
+        Tarih: <b>{tarih}</b> &nbsp; Saat: <b>{saat}</b>
+      </div>
+      <div style="margin-top:10px">
+        İşlem: <b>{html_escape(TUR_LABEL.get(tur, tur))}</b>
+      </div>
+    </div>
+    """
+    return render_page("QR", body, user=None)
+
+
+# -----------------------------
+# Attendance report (owner/accounting)
+# -----------------------------
+@app.route("/attendance", methods=["GET"])
+@role_required(ROLE_OWNER, ROLE_ACCOUNTING)
+def attendance_report():
+    u = current_user()
+    d1 = (request.args.get("d1") or (date.today() - timedelta(days=7)).isoformat()).strip()
+    d2 = (request.args.get("d2") or date.today().isoformat()).strip()
+
+    rows = query_all("""
+    SELECT a.*, us.full_name, us.username
+    FROM attendance a
+    JOIN users us ON us.id=a.user_id
+    WHERE a.tarih BETWEEN ? AND ?
+    ORDER BY a.tarih DESC, us.full_name ASC, a.id ASC
+    """, (d1, d2))
+
+    trs = ""
+    for r in rows:
+        trs += f"""
+        <tr>
+          <td>{html_escape(r['tarih'])}</td>
+          <td>{html_escape(r['saat'])}</td>
+          <td>{html_escape(r['full_name'])}</td>
+          <td>{html_escape(TUR_LABEL.get(r['tur'], r['tur']))}</td>
+          <td class="muted">{html_escape((r['ip'] or '')[:24])}</td>
+        </tr>
+        """
+    if not trs:
+        trs = "<tr><td colspan='5' class='muted'>Kayıt yok.</td></tr>"
+
+    body = f"""
+    <div class="card">
+      <h1 class="h1">Mesai Raporu</h1>
+      <form method="get" class="row" style="margin:10px 0 14px">
+        <div>
+          <label class="muted">Başlangıç</label>
+          <input name="d1" value="{html_escape(d1)}">
+        </div>
+        <div>
+          <label class="muted">Bitiş</label>
+          <input name="d2" value="{html_escape(d2)}">
+        </div>
+        <div style="grid-column:1/-1;display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn" type="submit">Filtrele</button>
+          <a class="btn2" href="/attendance.xlsx?d1={html_escape(d1)}&d2={html_escape(d2)}">Excel İndir</a>
+        </div>
+      </form>
+
+      <table>
+        <thead><tr><th>Tarih</th><th>Saat</th><th>Personel</th><th>İşlem</th><th>Cihaz/IP</th></tr></thead>
+        <tbody>{trs}</tbody>
+      </table>
+    </div>
+    """
+    return render_page("Mesai Raporu", body, user=u)
+
+@app.route("/attendance/team", methods=["GET"])
+@role_required(ROLE_RESPONSIBLE)
+def attendance_team_report():
+    u = current_user()
+
+    d1 = (request.args.get("d1") or (date.today() - timedelta(days=7)).isoformat()).strip()
+    d2 = (request.args.get("d2") or date.today().isoformat()).strip()
+
+    rows = query_all("""
+    SELECT a.*, us.full_name, us.username
+    FROM attendance a
+    JOIN users us ON us.id=a.user_id
+    WHERE us.responsible_id = ?
+      AND a.tarih BETWEEN ? AND ?
+    ORDER BY a.tarih DESC, us.full_name ASC, a.id ASC
+    """, (u["id"], d1, d2))
+
+    trs = ""
+    for r in rows:
+        trs += f"""
+        <tr>
+          <td>{html_escape(r['tarih'])}</td>
+          <td>{html_escape(r['saat'])}</td>
+          <td>{html_escape(r['full_name'])}</td>
+          <td>{html_escape(TUR_LABEL.get(r['tur'], r['tur']))}</td>
+          <td class="muted">{html_escape((r['ip'] or '')[:24])}</td>
+        </tr>
+        """
+    if not trs:
+        trs = "<tr><td colspan='5' class='muted'>Kayıt yok.</td></tr>"
+
+    body = f"""
+    <div class="card">
+      <h1 class="h1">Mesai Raporu (Ekibim)</h1>
+
+      <form method="get" class="row" style="margin:10px 0 14px">
+        <div>
+          <label class="muted">Başlangıç</label>
+          <input name="d1" value="{html_escape(d1)}">
+        </div>
+        <div>
+          <label class="muted">Bitiş</label>
+          <input name="d2" value="{html_escape(d2)}">
+        </div>
+        <div style="grid-column:1/-1;display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn" type="submit">Filtrele</button>
+        </div>
+      </form>
+
+      <table>
+        <thead><tr><th>Tarih</th><th>Saat</th><th>Personel</th><th>İşlem</th><th>Cihaz/IP</th></tr></thead>
+        <tbody>{trs}</tbody>
+      </table>
+    </div>
+    """
+    return render_page("Mesai (Ekibim)", body, user=u)
+
+
+@app.route("/attendance.xlsx")
+@role_required(ROLE_OWNER, ROLE_ACCOUNTING)
+def attendance_xlsx():
+    d1 = (request.args.get("d1") or (date.today() - timedelta(days=7)).isoformat()).strip()
+    d2 = (request.args.get("d2") or date.today().isoformat()).strip()
+
+    rows = query_all("""
+    SELECT a.tarih, a.saat, u.full_name, u.username, a.tur, a.ip, a.cihaz
+    FROM attendance a
+    JOIN users u ON u.id=a.user_id
+    WHERE a.tarih BETWEEN ? AND ?
+    ORDER BY a.tarih ASC, u.full_name ASC, a.id ASC
+    """, (d1, d2))
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Mesai"
+    ws.append(["Tarih", "Saat", "Personel", "Kullanıcı", "İşlem", "IP", "Cihaz(User-Agent)"])
+
+    for r in rows:
+        ws.append([
+            r["tarih"],
+            r["saat"],
+            r["full_name"],
+            r["username"],
+            TUR_LABEL.get(r["tur"], r["tur"]),
+            r["ip"] or "",
+            (r["cihaz"] or "")[:160]
+        ])
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+
+    filename = f"mesai_{d1}_to_{d2}.xlsx"
+    return send_file(
+        bio,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=filename
+    )
+
+
+# -----------------------------
+# Startup
+# -----------------------------
+
+# ✅ Gunicorn için de DB'yi ayağa kaldır (import sırasında çalışır)
+init_db()
+ensure_default_owner()
+
+if __name__ == "__main__":
+    init_db()
+    ensure_default_owner()
+    host = os.environ.get("IK_HOST", "127.0.0.1")
+    port = int(os.environ.get("IK_PORT", "4997"))
+    app.run(host=host, port=port)

@@ -1,0 +1,104 @@
+{% extends 'layout.html' %}
+{% block content %}
+
+<div class="card">
+  <div class="card-body p-4">
+    <div class="d-flex flex-wrap align-items-start justify-content-between gap-3">
+      <div>
+        <div class="text-muted">Talep No</div>
+        <h3 class="mb-1">{{ ticket.ticket_no }}</h3>
+        <div class="text-muted">{{ ticket.created_at.strftime('%Y-%m-%d %H:%M') }}</div>
+      </div>
+
+      <div class="text-end">
+        {% if ticket.priority == 'critical' %}
+          <span class="badge bg-danger fs-6">Kritik</span>
+        {% elif ticket.priority == 'high' %}
+          <span class="badge bg-warning text-dark fs-6">Yüksek</span>
+        {% elif ticket.priority == 'medium' %}
+          <span class="badge bg-info text-dark fs-6">Orta</span>
+        {% else %}
+          <span class="badge bg-secondary fs-6">Düşük</span>
+        {% endif %}
+        <div class="mt-2">
+          <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('index') }}">Listeye dön</a>
+        </div>
+      </div>
+    </div>
+
+    <hr class="my-4" />
+
+    <div class="row g-4">
+      <div class="col-lg-7">
+        <div class="mb-3">
+          <div class="text-muted">Talep Sahibi</div>
+          <div class="fs-5 fw-semibold">{{ ticket.full_name }}</div>
+        </div>
+
+        <div class="mb-3">
+          <div class="text-muted">Konu</div>
+          <div class="fs-5 fw-semibold">{{ ticket.subject }}</div>
+        </div>
+
+        <div class="mb-3">
+          <div class="text-muted">Açıklama</div>
+          <div class="bg-light p-3 rounded-4" style="white-space: pre-wrap;">{{ ticket.description }}</div>
+        </div>
+      </div>
+
+      <div class="col-lg-5">
+        <div class="text-muted mb-2">Ek Görsel</div>
+        {% if ticket.attachment_path %}
+          <a href="{{ url_for('uploads', filename=ticket.attachment_path) }}" target="_blank">
+            <img class="img-fluid rounded-4" src="{{ url_for('uploads', filename=ticket.attachment_path) }}" alt="Ek" />
+          </a>
+          <div class="text-muted small mt-2">{{ ticket.attachment_name }}</div>
+        {% else %}
+          <div class="text-muted">Ek yok.</div>
+        {% endif %}
+      </div>
+    </div>
+{% if session.get("it_logged_in") %}
+<hr class="my-4" />
+
+<div class="card">
+  <div class="card-body p-4">
+    <h5 class="mb-2">IT İşlem</h5>
+    <div class="text-muted mb-3">Talep durumunu güncelle ve açıklama ekle.</div>
+
+    <form method="POST" action="{{ url_for('it_update_ticket', ticket_id=ticket.id) }}">
+      <div class="row g-3">
+        <div class="col-md-4">
+          <label class="form-label">Durum</label>
+          <select class="form-select" name="status" required>
+            <option value="open" {% if ticket.status=='open' %}selected{% endif %}>Açık</option>
+            <option value="pending" {% if ticket.status=='pending' %}selected{% endif %}>Beklemede</option>
+            <option value="forwarded" {% if ticket.status=='forwarded' %}selected{% endif %}>Yönlendirildi</option>
+            <option value="closed" {% if ticket.status=='closed' %}selected{% endif %}>Kapalı</option>
+          </select>
+        </div>
+
+        <div class="col-md-8">
+          <label class="form-label">IT Açıklaması</label>
+          <input class="form-control" name="status_note" placeholder="Örn: Kullanıcı yönlendirildi / işlem tamamlandı"
+                 value="{{ ticket.status_note or '' }}">
+        </div>
+      </div>
+
+      <div class="d-flex gap-2 mt-3">
+        <button class="btn btn-primary" type="submit">Kaydet</button>
+        <a class="btn btn-outline-secondary" href="{{ url_for('it_tickets') }}">IT Liste</a>
+      </div>
+
+      {% if ticket.status_updated_at %}
+        <div class="text-muted small mt-3">Son güncelleme: {{ ticket.status_updated_at }}</div>
+      {% endif %}
+    </form>
+  </div>
+</div>
+{% endif %}
+
+  </div>
+</div>
+
+{% endblock %}
