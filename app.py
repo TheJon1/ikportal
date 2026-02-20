@@ -4909,17 +4909,4 @@ init_db()
 ensure_default_owner()
 
 if __name__ == "__main__":
-    import sys
-
-    init_db()
-    ensure_default_owner()
-
-    # 🔔 Reminders mail worker manuel çalıştırma
-    if "--run-reminders" in sys.argv:
-        count = run_reminders_mail_worker()
-        print(f"Reminders worker tamamlandı. Gönderilen mail sayısı: {count}")
-        sys.exit(0)
-
-    host = os.environ.get("IK_HOST", "127.0.0.1")
-    port = int(os.environ.get("IK_PORT", "4997"))
-    app.run(host=host, port=port)
+    app.run()
