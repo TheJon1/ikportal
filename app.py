@@ -2919,6 +2919,7 @@ def index():
 
         // subtle text
         ctx.font = "12px sans-serif";
+        ctx.fillStyle = "#ffffff";   // yazı rengi beyaz
         ctx.fillText("Space / Click: Jump • R: Restart", 10, 18);
       }
 
