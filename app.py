@@ -432,6 +432,17 @@ def init_db():
     )
     """)
 
+    exec_sql("""
+    CREATE TABLE IF NOT EXISTS dino_scores (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        score INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+    """)
+    exec_sql("CREATE INDEX IF NOT EXISTS idx_dino_scores_user_id ON dino_scores(user_id)")
+    exec_sql("CREATE INDEX IF NOT EXISTS idx_dino_scores_score ON dino_scores(score)")    
+
     conn.commit()
     conn.close()
 
