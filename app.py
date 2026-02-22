@@ -138,28 +138,20 @@ def is_protected_user(row_or_uid):
     """
     Demo modda korunacak kullanıcılar:
     - ID=1 (klasik admin)
-    - role='owner' (case-insensitive)
+    - role=owner
     """
-    uid = None
-    role = ""
-
-    # sqlite3.Row veya dict gibi mapping ise
     try:
-        uid = int(row_or_uid["id"])
-        role = (row_or_uid["role"] or "").strip()
+        # row dict ise
+        uid = int(row_or_uid.get("id"))
+        role = (row_or_uid.get("role") or "").strip()
     except Exception:
-        pass
-
-    # uid direkt gelmişse
-    if uid is None:
-        try:
-            uid = int(row_or_uid)
-        except Exception:
-            uid = -1
+        # uid olarak geldiyse
+        uid = int(row_or_uid)
+        role = ""
 
     if uid == 1:
         return True
-    if role.lower() == "owner":
+    if role == ROLE_OWNER:
         return True
     return False
 
@@ -2993,7 +2985,7 @@ def leave_new():
         <div class="row" style="margin-top:12px">
           <div>
             <label class="muted">İzin Türü</label>
-            <select name="leave_type">
+            <select name="leave_type" id="leave_type" onchange="updateHalfDayAvailability()">
               <option>Yillik</option>
               <option>Rapor</option>
               <option>Mazeret</option>
@@ -3019,7 +3011,30 @@ def leave_new():
         </div>
 
       <script>
+
+      function updateHalfDayAvailability() {
+          var lt = document.getElementById("leave_type").value;
+          var halfSel = document.getElementById("is_half_day");
+
+          if (lt == "Yillik") {
+              halfSel.disabled = false;
+              toggleHalfDay();
+          } else {
+              halfSel.value = "0";
+              halfSel.disabled = true;
+              document.getElementById("halfDayPartBox").style.display = "none";
+          }
+      }
+
+      document.addEventListener("DOMContentLoaded", function() {
+          updateHalfDayAvailability();
+      });
+
       function toggleHalfDay() {
+          if (document.getElementById("is_half_day").disabled) {
+              document.getElementById("halfDayPartBox").style.display = "none";
+              return;
+          }
           var val = document.getElementById("is_half_day").value;
           document.getElementById("halfDayPartBox").style.display = (val == "1") ? "block" : "none";
       }
