@@ -130,6 +130,31 @@ def exec_sql(sql, params=()):
     conn.close()
     return last_id
 
+def is_demo_mode():
+    return os.environ.get("IK_DEMO_MODE", "0") == "1"
+
+
+def is_protected_user(row_or_uid):
+    """
+    Demo modda korunacak kullanıcılar:
+    - ID=1 (klasik admin)
+    - role=owner
+    """
+    try:
+        # row dict ise
+        uid = int(row_or_uid.get("id"))
+        role = (row_or_uid.get("role") or "").strip()
+    except Exception:
+        # uid olarak geldiyse
+        uid = int(row_or_uid)
+        role = ""
+
+    if uid == 1:
+        return True
+    if role == ROLE_OWNER:
+        return True
+    return False
+
 def table_has_column(conn, table, col):
     cur = conn.execute(f"PRAGMA table_info({table})")
     cols = [r[1] for r in cur.fetchall()]
@@ -4424,6 +4449,13 @@ def users_edit(uid):
     )
 
     if request.method == "POST":
+        # DEMO MODE: admin/owner kullanıcı değiştirilemez
+        if is_demo_mode() and is_protected_user(row):
+            return render_page(
+                "Kullanıcı Düzenle",
+                "<div class='card'><div class='pill bad'>DEMO MOD: Admin/Owner kullanıcı düzenlenemez.</div><div style='margin-top:10px'><a class='btn2' href='/users'>Geri</a></div></div>",
+                user=u
+            )        
         full_name = (request.form.get("full_name") or "").strip()
         role = (request.form.get("role") or ROLE_PERSONNEL).strip()
         is_active = 1 if (request.form.get("is_active") == "1") else 0
