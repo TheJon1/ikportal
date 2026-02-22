@@ -5006,5 +5006,46 @@ def attendance_xlsx():
 init_db()
 ensure_default_owner()
 
+@app.route("/api/dino/submit", methods=["POST"])
+def dino_submit():
+    if "user_id" not in session:
+        return {"ok": False}, 403
+
+    try:
+        score = int(request.json.get("score", 0))
+    except Exception:
+        return {"ok": False}, 400
+
+    if score <= 0:
+        return {"ok": False}, 400
+
+    exec_sql(
+        "INSERT INTO dino_scores (user_id, score) VALUES (?, ?)",
+        (session["user_id"], score)
+    )
+
+    return {"ok": True}
+
+
+@app.route("/api/dino/leaderboard")
+def dino_leaderboard():
+    rows = query_all("""
+        SELECT u.full_name, MAX(d.score) as best_score
+        FROM dino_scores d
+        JOIN users u ON u.id = d.user_id
+        GROUP BY d.user_id
+        ORDER BY best_score DESC
+        LIMIT 10
+    """)
+
+    data = []
+    for r in rows:
+        data.append({
+            "name": r["full_name"],
+            "score": r["best_score"]
+        })
+
+    return {"leaders": data}
+
 if __name__ == "__main__":
     app.run()
