@@ -2751,7 +2751,7 @@ def index():
     body = f"""
     <div class="two">
       <div class="card">
-        <h1 class="h1">Hoş geldin, {html_escape(u['full_name'])}</h1>
+        <h1 class="h1">Hoş geldin1, {html_escape(u['full_name'])}</h1>
         <div class="muted">Bugün: {today}</div>
         <div style="margin-top:10px" class="pill">
             <div class="muted">{year} Yıllık İzin: <b>{remaining:.1f}</b> gün kaldı (kullanılan: {used:.1f})</div>
