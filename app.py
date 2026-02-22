@@ -2815,6 +2815,218 @@ def index():
           {cards}
         </div>
         """
+    dino_html = """
+    <div class="card" style="margin-top:14px">
+      <h2 class="h1">Dino Run</h2>
+      <div class="muted">Boşluk (Space) veya tıkla: Zıpla • Yeniden başlat: R</div>
+
+      <div style="margin-top:12px;display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start">
+        <div style="flex:1;min-width:320px">
+          <canvas id="dinoCanvas" width="760" height="220"
+                  style="width:100%;max-width:760px;background:rgba(15,23,42,.35);border:1px solid rgba(148,163,184,.20);border-radius:14px"></canvas>
+
+          <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+            <span class="pill" style="display:inline-flex;gap:8px;align-items:center">
+              Skor: <b id="dinoScore">0</b>
+            </span>
+            <span class="pill" style="display:inline-flex;gap:8px;align-items:center">
+              En iyi: <b id="dinoBest">0</b>
+            </span>
+            <span id="dinoStatus" class="muted"></span>
+          </div>
+        </div>
+
+        <div style="width:320px;max-width:100%">
+          <div class="pill" style="margin-bottom:10px">🏆 Liderlik Tablosu (Top 10)</div>
+          <div id="dinoLeaders" class="muted">Yükleniyor...</div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+    (function(){
+      var canvas = document.getElementById("dinoCanvas");
+      if(!canvas) return;
+      var ctx = canvas.getContext("2d");
+
+      var scoreEl = document.getElementById("dinoScore");
+      var bestEl  = document.getElementById("dinoBest");
+      var statusEl = document.getElementById("dinoStatus");
+      var leadersEl = document.getElementById("dinoLeaders");
+
+      var W = canvas.width, H = canvas.height;
+      var groundY = H - 32;
+
+      var dino = { x: 40, y: groundY - 34, w: 28, h: 34, vy: 0, onGround: true };
+      var obstacles = [];
+      var t = 0;
+      var score = 0;
+      var best = 0;
+      var speed = 3.2;
+      var running = true;
+      var lastSpawn = 0;
+
+      function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
+
+      function reset(){
+        obstacles = [];
+        t = 0;
+        score = 0;
+        speed = 3.2;
+        dino.y = groundY - dino.h;
+        dino.vy = 0;
+        dino.onGround = true;
+        running = true;
+        statusEl.textContent = "";
+      }
+
+      function jump(){
+        if(!running) return;
+        if(dino.onGround){
+          dino.vy = -9.8;
+          dino.onGround = false;
+        }
+      }
+
+      function spawnObstacle(){
+        var h = 24 + Math.floor(Math.random()*18);
+        var w = 14 + Math.floor(Math.random()*10);
+        obstacles.push({ x: W + 10, y: groundY - h, w: w, h: h });
+      }
+
+      function collide(a,b){
+        return !(a.x+a.w < b.x || a.x > b.x+b.w || a.y+a.h < b.y || a.y > b.y+b.h);
+      }
+
+      function draw(){
+        // bg
+        ctx.clearRect(0,0,W,H);
+
+        // ground
+        ctx.beginPath();
+        ctx.moveTo(0, groundY+0.5);
+        ctx.lineTo(W, groundY+0.5);
+        ctx.stroke();
+
+        // dino
+        ctx.fillRect(dino.x, dino.y, dino.w, dino.h);
+
+        // obstacles
+        for(var i=0;i<obstacles.length;i++){
+          var o = obstacles[i];
+          ctx.fillRect(o.x, o.y, o.w, o.h);
+        }
+
+        // subtle text
+        ctx.font = "12px sans-serif";
+        ctx.fillText("Space / Click: Jump • R: Restart", 10, 18);
+      }
+
+      function update(){
+        if(!running){
+          draw();
+          return;
+        }
+
+        t++;
+
+        // speed up slowly
+        speed = 3.2 + (t/600);
+
+        // gravity
+        dino.vy += 0.55;
+        dino.y += dino.vy;
+
+        if(dino.y >= groundY - dino.h){
+          dino.y = groundY - dino.h;
+          dino.vy = 0;
+          dino.onGround = true;
+        }
+
+        // spawn
+        if(t - lastSpawn > (70 + Math.random()*60)){
+          spawnObstacle();
+          lastSpawn = t;
+        }
+
+        // move obstacles
+        for(var i=obstacles.length-1;i>=0;i--){
+          obstacles[i].x -= speed;
+          if(obstacles[i].x + obstacles[i].w < -10){
+            obstacles.splice(i,1);
+          }
+        }
+
+        // collisions
+        for(var j=0;j<obstacles.length;j++){
+          if(collide(dino, obstacles[j])){
+            gameOver();
+            break;
+          }
+        }
+
+        // score
+        score += 1;
+        if(score > best) best = score;
+
+        scoreEl.textContent = String(Math.floor(score/5));
+        bestEl.textContent  = String(Math.floor(best/5));
+
+        draw();
+        requestAnimationFrame(update);
+      }
+
+      function gameOver(){
+        running = false;
+        statusEl.textContent = "💥 Oyun bitti! R ile tekrar başlat.";
+        // submit best score
+        var bestScore = Math.floor(best/5);
+
+        fetch("/api/dino/submit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ score: bestScore })
+        }).then(function(){ loadLeaders(); }).catch(function(){});
+      }
+
+      function loadLeaders(){
+        fetch("/api/dino/leaderboard")
+          .then(function(r){ return r.json(); })
+          .then(function(data){
+            var arr = (data && data.leaders) ? data.leaders : [];
+            if(!arr.length){
+              leadersEl.innerHTML = "<div class='muted'>Henüz skor yok.</div>";
+              return;
+            }
+            var html = "<table style='width:100%'><thead><tr><th>#</th><th>İsim</th><th style='text-align:right'>Skor</th></tr></thead><tbody>";
+            for(var i=0;i<arr.length;i++){
+              var nm = (arr[i].name || "").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+              var sc = arr[i].score;
+              html += "<tr><td class='muted'>"+(i+1)+"</td><td>"+nm+"</td><td style='text-align:right'><b>"+sc+"</b></td></tr>";
+            }
+            html += "</tbody></table>";
+            leadersEl.innerHTML = html;
+          })
+          .catch(function(){
+            leadersEl.innerHTML = "<div class='muted'>Liderlik tablosu yüklenemedi.</div>";
+          });
+      }
+
+      // controls
+      document.addEventListener("keydown", function(e){
+        if(e.code === "Space"){ e.preventDefault(); jump(); }
+        if(e.key === "r" || e.key === "R"){ reset(); requestAnimationFrame(update); }
+      });
+      canvas.addEventListener("mousedown", function(){ jump(); });
+      canvas.addEventListener("touchstart", function(e){ e.preventDefault(); jump(); }, {passive:false});
+
+      // start
+      loadLeaders();
+      requestAnimationFrame(update);
+      setInterval(loadLeaders, 15000);
+    })();
+    </script>
+    """
 
     body = f"""
     <div class="two">
@@ -2843,6 +3055,8 @@ def index():
         {leave_html}
       </div>
     </div>
+    
+    {dino_html}
     """
     return render_page("Ana Sayfa", body, user=u)
 
