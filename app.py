@@ -138,20 +138,28 @@ def is_protected_user(row_or_uid):
     """
     Demo modda korunacak kullanıcılar:
     - ID=1 (klasik admin)
-    - role=owner
+    - role='owner' (case-insensitive)
     """
+    uid = None
+    role = ""
+
+    # sqlite3.Row veya dict gibi mapping ise
     try:
-        # row dict ise
-        uid = int(row_or_uid.get("id"))
-        role = (row_or_uid.get("role") or "").strip()
+        uid = int(row_or_uid["id"])
+        role = (row_or_uid["role"] or "").strip()
     except Exception:
-        # uid olarak geldiyse
-        uid = int(row_or_uid)
-        role = ""
+        pass
+
+    # uid direkt gelmişse
+    if uid is None:
+        try:
+            uid = int(row_or_uid)
+        except Exception:
+            uid = -1
 
     if uid == 1:
         return True
-    if role == ROLE_OWNER:
+    if role.lower() == "owner":
         return True
     return False
 
