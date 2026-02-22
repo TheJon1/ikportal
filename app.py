@@ -2823,8 +2823,8 @@ def index():
       <div style="margin-top:12px;display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start">
         <div style="flex:1;min-width:320px">
           <canvas id="dinoCanvas" width="760" height="220"
-                  style="width:100%;max-width:760px;background:rgba(15,23,42,.35);border:1px solid rgba(148,163,184,.20);border-radius:14px"></canvas>
-
+                          style="width:100%;max-width:760px;background:rgba(248,250,252,1);border:1px solid rgba(148,163,184,.35);border-radius:14px"></canvas>
+                          
           <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">
             <span class="pill" style="display:inline-flex;gap:8px;align-items:center">
               Skor: <b id="dinoScore">0</b>
@@ -2922,12 +2922,12 @@ def index():
         ctx.fillText("Space / Click: Jump • R: Restart", 10, 18);
       }
 
-      function update(){
-        if(!running){
-          draw();
-          return;
-        }
-
+      function update(ts){
+        if(!lastTs) lastTs = ts;
+        var dt = (ts - lastTs) / 16.666;   // 60fps baz alınır
+        lastTs = ts;
+        if(dt > 2.5) dt = 2.5;            // sekme değişince uçmasın
+        
         t++;
 
         // speed up slowly
