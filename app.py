@@ -136,25 +136,52 @@ def is_demo_mode():
 
 def is_protected_user(row_or_uid):
     """
-    Demo modda korunacak kullanıcılar:
-    - ID=1 (klasik admin)
-    - role=owner
+    Demo modda korunacak kullanıcıyı tespit eder.
+    - int / str uid gelebilir
+    - sqlite3.Row gelebilir (row["id"] gibi)
+    - dict gelebilir (row.get("id") gibi)
     """
-    try:
-        # row dict ise
-        uid = int(row_or_uid.get("id"))
-        role = (row_or_uid.get("role") or "").strip()
-    except Exception:
-        # uid olarak geldiyse
-        uid = int(row_or_uid)
-        role = ""
+    # sqlite3.Row dict değildir; hem ["id"] hem .get desteklemek için normalize edelim
+    if row_or_uid is None:
+        return False
 
-    if uid == 1:
+    uid = None
+    role = ""
+
+    # sqlite3.Row veya dict benzeri
+    if hasattr(row_or_uid, "keys"):
+        try:
+            # sqlite3.Row: row["id"]
+            uid = row_or_uid["id"] if "id" in row_or_uid.keys() else None
+            role = (row_or_uid["role"] or "").strip() if "role" in row_or_uid.keys() else ""
+        except Exception:
+            uid = None
+            role = ""
+
+    # uid direkt verilmişse
+    if uid is None:
+        try:
+            uid = int(row_or_uid)
+        except Exception:
+            uid = None
+
+    # role yoksa DB’den çek
+    if (not role) and uid is not None:
+        try:
+            r = query_one("SELECT role FROM users WHERE id=?", (uid,))
+            if r:
+                role = (r["role"] or "").strip()
+        except Exception:
+            role = ""
+
+    # Burada hangi kullanıcı(lar) korunacaksa kuralı koy
+    # Örnek: Admin/Owner veya belirli kullanıcı id’leri korunur
+    if uid in (1,):          # id=1 korunacak örneği
         return True
-    if role == ROLE_OWNER:
+    if role.lower() in ("owner",):
         return True
+
     return False
-
 def table_has_column(conn, table, col):
     cur = conn.execute(f"PRAGMA table_info({table})")
     cols = [r[1] for r in cur.fetchall()]
