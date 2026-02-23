@@ -2918,6 +2918,7 @@ def index():
         }
 
         // subtle text
+        ctx.fillStyle = "rgba(255,255,255,0.8)";
         ctx.font = "12px sans-serif";
         ctx.fillText("Space / Click: Jump • R: Restart", 10, 18);
       }
